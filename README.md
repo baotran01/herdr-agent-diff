@@ -1,6 +1,6 @@
 # Herdr Agent Diff
 
-Herdr Agent Diff is a macOS arm64 plugin for [Herdr](https://github.com/baotran/herdr) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
+Herdr Agent Diff is a macOS arm64 plugin for [Herdr](https://herdr.dev/) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
 
 The viewer has two tabs:
 
@@ -21,7 +21,7 @@ Press `g` to switch between the two Changes views. This makes it easy to see bot
 - A grouped, collapsible folder tree shared by the Changes and Files tabs.
 - Right-aligned per-file `+` and `-` counts in the Changes tab.
 - Unified code diffs with old/new line-number gutters, addition/deletion highlighting, and collapsed unchanged regions.
-- Syntax-highlighted file browsing with language detection from file extensions.
+- File browsing with an immediate plain-text preview, followed by syntax highlighting based on file extensions.
 - Text search, keyboard navigation, mouse support, and scrollbars for both the sidebar and diff pane.
 - Hideable sidebar shared by the Changes and Files tabs (`b`).
 - Read-only operation on the project workspace and Git repository.
