@@ -52,25 +52,24 @@ pub fn pane_root(herdr: &impl Herdr, pane_id: &str) -> Result<std::path::PathBuf
         .ok_or_else(|| Error::Message("Herdr pane has no working directory".into()))
 }
 
-pub fn pane_agent_details(
-    herdr: &impl Herdr,
-    pane_id: &str,
-) -> Result<(Option<String>, Option<String>)> {
-    let value = pane_info(herdr, pane_id)?;
-    let pane = value
+pub fn pane_left_neighbor(herdr: &impl Herdr, pane_id: &str) -> Result<Option<String>> {
+    let value = checked(
+        herdr,
+        &[
+            "pane".into(),
+            "neighbor".into(),
+            "--pane".into(),
+            pane_id.into(),
+            "--direction".into(),
+            "left".into(),
+        ],
+    )?;
+    Ok(value
         .get("result")
-        .and_then(|result| result.get("pane"))
-        .ok_or_else(|| Error::Message("Herdr pane response has no pane record".into()))?;
-    let agent = pane
-        .get("agent")
+        .and_then(|result| result.get("neighbor"))
+        .and_then(|neighbor| neighbor.get("neighbor_pane_id"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let session = pane
-        .get("agent_session")
-        .and_then(|value| value.get("value"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    Ok((agent, session))
+        .map(ToOwned::to_owned))
 }
 
 pub fn open_or_focus(

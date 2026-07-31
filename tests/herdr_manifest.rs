@@ -33,8 +33,6 @@ fn context() -> PluginContext {
         pane_id: Some("w1:p1".into()),
         workspace_id: Some("w1".into()),
         cwd: Some("/tmp/project".into()),
-        agent: Some("codex".into()),
-        session_ref: Some("native".into()),
     }
 }
 
@@ -52,7 +50,7 @@ fn manifest_declares_documented_075_events_action_and_split_pane() {
         .iter()
         .filter_map(|event| event["on"].as_str())
         .collect();
-    assert_eq!(names, ["pane.agent_detected", "pane.closed", "pane.exited"]);
+    assert_eq!(names, ["pane.closed", "pane.exited"]);
     assert_eq!(manifest["actions"][0]["id"].as_str(), Some("open"));
     assert_eq!(manifest["actions"][1]["id"].as_str(), Some("open-tab"));
     assert_eq!(manifest["panes"][0]["id"].as_str(), Some("viewer"));

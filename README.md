@@ -1,32 +1,48 @@
 # Herdr Agent Diff
 
-Herdr Agent Diff is a macOS arm64 plugin for [Herdr](https://github.com/baotran/herdr) that makes an agent's filesystem changes easy to inspect. When Herdr detects an agent pane, the plugin captures a best-effort read-only baseline. When opened, it compares the current workspace with that baseline and presents the result in a terminal UI.
+Herdr Agent Diff is a macOS arm64 plugin for [Herdr](https://github.com/baotran/herdr) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
 
 The viewer has two tabs:
 
-- **Changes** shows added, modified, deleted, and exact-content renamed files. Selecting a file opens a readable code diff.
-- **Files** shows the workspace tree with line numbers and syntax highlighting for source files.
+- **Changes** shows Git changes and unpushed commits. Selecting a file opens a readable code diff.
+- **Files** shows the workspace tree with language badges, line numbers, and syntax highlighting for source files.
 
-The viewer can open beside the agent pane or in a separate Herdr tab. It does not open automatically when an agent starts.
+The Changes tab has two comparison views:
+
+- **Git diff** compares the working tree with `HEAD`, including staged, unstaged, deleted, renamed, and untracked files.
+- **Unpushed commits** compares `HEAD` with the branch's tracked remote (`@{upstream}`), showing committed changes that are not on the remote branch yet.
+
+Press `g` to switch between the two Changes views. This makes it easy to see both edits that still need committing and commits that still need pushing.
 
 ## Features
 
-- Agent-session diffs based on the filesystem state captured when the agent is detected.
-- Git diffs against `HEAD`, including tracked, untracked, deleted, and renamed files where Git can identify them.
+- Combined local Git diff for staged, unstaged, deleted, renamed, and untracked files.
+- Unpushed-commit diff for committed changes ahead of the tracked remote branch.
 - A grouped, collapsible folder tree shared by the Changes and Files tabs.
 - Right-aligned per-file `+` and `-` counts in the Changes tab.
 - Unified code diffs with old/new line-number gutters, addition/deletion highlighting, and collapsed unchanged regions.
 - Syntax-highlighted file browsing with language detection from file extensions.
 - Text search, keyboard navigation, mouse support, and scrollbars for both the sidebar and diff pane.
-- Explicit mode hint in the footer: `g: Git diff / Agent`.
-- Read-only operation on the project workspace.
+- Hideable sidebar shared by the Changes and Files tabs (`b`).
+- Read-only operation on the project workspace and Git repository.
+
+## Tech stack
+
+- **Language:** Rust.
+- **Terminal UI:** [`ratatui`](https://ratatui.rs/) for layout, widgets, rendering, and test backends.
+- **Terminal input and backend:** [`crossterm`](https://github.com/crossterm-rs/crossterm) for keyboard and mouse events, raw mode, alternate-screen handling, and terminal capabilities.
+- **File watching:** [`notify`](https://github.com/notify-rs/notify) for detecting workspace changes while the viewer is open.
+- **Diff parsing and syntax highlighting:** a bounded unified diff parser and [`syntect`](https://github.com/trishume/syntect) for syntax highlighting.
+- **Workspace scanning:** [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) for ignore-file-aware traversal, with platform filesystem support through [`rustix`](https://github.com/bytecodealliance/rustix) on Unix.
+- **Integration:** A native macOS arm64 Herdr plugin using read-only Git subprocesses.
 
 ## Requirements
 
 - macOS on Apple silicon (`aarch64-apple-darwin`).
 - Rust and Cargo.
 - Herdr 0.7.5 or newer.
-- Git for Git diff mode.
+- Git.
+- A tracked remote branch (`@{upstream}`) to use Unpushed commits mode.
 
 The plugin is currently packaged for macOS arm64 because its manifest declares that target and its release command builds for `aarch64-apple-darwin`.
 
@@ -44,13 +60,12 @@ Link the project into Herdr from the repository root:
 herdr plugin link "$PWD"
 ```
 
-The plugin manifest, [`herdr-plugin.toml`](herdr-plugin.toml), registers the following Herdr events and actions:
+The plugin manifest, [`herdr-plugin.toml`](herdr-plugin.toml), registers pane cleanup events and the following actions:
 
 | Name | Purpose |
 | --- | --- |
-| `pane.agent_detected` | Capture the agent-session baseline. |
-| `pane.closed` | Remove state for a closed pane. |
-| `pane.exited` | Remove state for an exited pane. |
+| `pane.closed` | Remove stale viewer mappings for a closed pane. |
+| `pane.exited` | Remove stale viewer mappings for an exited pane. |
 | `herdr-agent-diff.open` | Open the viewer in a split beside the agent pane. |
 | `herdr-agent-diff.open-tab` | Open the viewer in a separate Herdr tab. |
 
@@ -61,36 +76,32 @@ Example Herdr key bindings:
 key = "prefix+d"
 type = "plugin_action"
 command = "herdr-agent-diff.open"
-description = "agent filesystem changes"
+description = "Git changes"
 
 [[keys.command]]
 key = "prefix+shift+d"
 type = "plugin_action"
 command = "herdr-agent-diff.open-tab"
-description = "agent filesystem changes in tab"
+description = "Git changes in tab"
 ```
-
-After linking, restart an already-running agent pane if it was not detected with the new plugin installed. New agent panes will be handled automatically.
 
 ## Using the viewer
 
 ### Changes tab
 
-The sidebar is organized by folders. Click a folder row, or place the cursor on it and press Enter, to expand or collapse that folder. The text column remains aligned when folders are collapsed.
+The sidebar is organized by folders. Click a folder row, or place the cursor on it and press Enter, to expand or collapse that folder. Select a file to inspect its diff. Press `b` to hide or show the sidebar.
 
-Select a file to inspect its diff. The sidebar displays file status and right-aligned additions/removals. Status colors are informational and follow the active Herdr theme.
-
-The footer calls out the most important mode switch:
+The Changes tab opens in Git diff mode. Press `g` to switch to Unpushed commits mode:
 
 ```text
-g: Git diff / Agent
+Git diff  ⇄  Unpushed commits
 ```
 
-Press `g` at any time to switch between the agent-session comparison and the Git comparison.
+Git diff answers: “What local edits are not in `HEAD`?” Unpushed commits answers: “What committed edits are ahead of the tracked remote branch?”
 
 ### Files tab
 
-The Files tab uses the same folder grouping, indentation, collapse behavior, selection gutter, and navigation styling as the Changes tab. Select a file to browse its current contents with line numbers and syntax highlighting.
+The Files tab uses the same folder grouping, indentation, collapse behavior, selection gutter, and navigation styling as the Changes tab. Select a file to browse its current contents with line numbers and syntax highlighting. Press `b` to hide or show the sidebar, or `/` to search filenames or relative paths with a case-insensitive substring filter.
 
 ### Keyboard controls
 
@@ -98,13 +109,14 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | --- | --- |
 | `1` | Select the Changes tab. |
 | `2` | Select the Files tab. |
-| `g` | Toggle Git diff and Agent diff modes. |
+| `b` | Hide or show the sidebar. |
+| `g` | Toggle Git diff and Unpushed commits modes. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
 | Arrow keys, `h`/`j`/`k`/`l` | Navigate the focused area. |
 | `Enter` | Open a selected file or toggle a selected folder. |
 | `/` | Filter the sidebar. |
 | `r` | Refresh the current comparison or file view. |
-| `⌘C` | Copy the selected text from the read-only Files pane. Mouse selections are also copied on release. |
+| `⌘C` | Copy selected text from the read-only Files pane. |
 | `?` | Show the help overlay. |
 | `q` or `Esc` | Close the viewer or dismiss an overlay. |
 
@@ -112,17 +124,26 @@ Mouse clicks select tabs, folders, and files. Drag the sidebar or diff scrollbar
 
 ## Diff semantics
 
-### Agent diff
-
-Agent diff mode compares the current workspace with the baseline captured when Herdr reports `pane.agent_detected`. It is intended to answer: “What changed during this agent session?”
-
-The baseline is stored per Herdr pane in the plugin state directory. It is refreshed when a new agent-detection event is received and removed when the pane closes or exits.
-
 ### Git diff
 
-Git diff mode compares the workspace with `HEAD` using read-only Git commands. It is intended to answer: “What differs from the current commit?”
+Git diff compares the current working tree with `HEAD` using read-only Git commands. It includes:
 
-Git mode includes tracked modifications, deleted files, untracked files, and Git-reported renames when available. It requires a repository with a valid `HEAD`; a repository without an initial commit cannot provide a `HEAD` comparison. The plugin does not modify the index, create commits, stage files, or run write-oriented Git commands.
+- staged changes;
+- unstaged changes;
+- deleted and renamed tracked files; and
+- untracked, non-ignored files.
+
+The Changes sidebar groups files by `staged`, `unstaged`, `mixed` (both staged and unstaged), or `untracked` status. Empty status groups are hidden, and folders remain collapsible within each group.
+
+This is the view for edits that still need to be committed.
+
+### Unpushed commits
+
+Unpushed commits compares `HEAD` with `@{upstream}`. It shows committed changes that exist on the local branch but have not reached its tracked remote branch. It does not include current uncommitted or untracked edits; switch to Git diff for those.
+
+If the branch has no upstream, the viewer explains that `git push -u` is required before unpushed commits can be determined.
+
+The plugin does not modify the index, create commits, stage files, push changes, or run write-oriented Git commands.
 
 ## What the plugin reads and ignores
 
@@ -131,58 +152,30 @@ The scanner is deliberately conservative:
 - It never follows symbolic links while scanning the workspace.
 - It honors supported ignore files, including `.gitignore` and `.ignore`.
 - It excludes common repository metadata and generated directories such as `.git`, `.hg`, `.svn`, `node_modules`, `target`, `dist`, `.next`, and `.cache`.
-- It limits individual text snapshots to 2 MiB and skips binary or invalid UTF-8 content from inline diff rendering.
-- It caps the stored snapshot data for a pane at 256 MiB.
+- It limits individual text reads to 2 MiB and skips binary or invalid UTF-8 content from inline source browsing.
 - It applies file-count, file-size, scan-byte, and Git-output limits to keep the viewer responsive.
 
-The plugin stores snapshots and viewer mappings under `HERDR_PLUGIN_STATE_DIR`, which Herdr supplies for the installed plugin. Project files are not rewritten, and the plugin does not transmit workspace contents to a network service.
+The plugin stores only viewer mappings under `HERDR_PLUGIN_STATE_DIR`, which Herdr supplies for the installed plugin. Project files are not rewritten, and the plugin does not transmit workspace contents to a network service.
 
 ## Architecture
 
-The implementation is split into small Rust modules:
-
 | Module | Responsibility |
 | --- | --- |
-| `src/main.rs` | Herdr event/action entry points, state lookup, and viewer startup. |
-| `src/model.rs` | Manifest, file records, change kinds, and shared limits. |
-| `src/snapshot.rs` | Safe workspace scanning, baseline capture, and change classification. |
-| `src/diff.rs` | Text diff generation, hunk parsing, and rendered diff rows. |
-| `src/git.rs` | Read-only Git status, file listing, and `HEAD` comparisons. |
+| `src/main.rs` | Herdr action/event entry points, viewer startup, and mapping cleanup. |
+| `src/model.rs` | Current-file metadata, text eligibility, and Git change kinds. |
+| `src/snapshot.rs` | Safe workspace scanning and bounded file reads. |
+| `src/diff.rs` | Unified diff parsing and rendered diff rows. |
+| `src/git.rs` | Read-only working-tree and unpushed Git comparisons. |
 | `src/app.rs` | Terminal UI, tabs, navigation, filtering, scrolling, input, and rendering. |
-| `src/theme.rs` | Herdr-aware theme colors and syntax-highlighting styles. |
-| `src/manifest.rs` | Plugin manifest and state serialization helpers. |
+| `src/state.rs` | Viewer mapping persistence. |
 
 The high-level lifecycle is:
 
 ```text
-agent_detected
-      │
-      ▼
-scan workspace ──► save per-pane baseline
-      │
-      ▼
-open / open-tab ──► load baseline ──► classify changes ──► render viewer
-      │
-      ├── g ──► run read-only Git comparison
-      └── close/exit ──► remove per-pane state
-```
-
-## Project layout
-
-```text
-.
-├── herdr-plugin.toml       # Herdr plugin metadata, events, and actions
-├── Cargo.toml               # Rust package and dependency configuration
-├── src/
-│   ├── app.rs               # Terminal UI
-│   ├── diff.rs              # Agent diff rendering
-│   ├── git.rs               # Git diff mode
-│   ├── main.rs              # Plugin entry point
-│   ├── model.rs             # Shared data model
-│   ├── snapshot.rs          # Workspace snapshots
-│   └── theme.rs             # Theme integration
-└── tests/
-    └── snapshots/           # UI snapshot fixtures
+open / open-tab ──► scan workspace ──► load Git changes ──► render viewer
+                                      │
+                                      ├── g ──► compare committed changes with @{upstream}
+                                      └── b ──► hide/show sidebar
 ```
 
 ## Development
@@ -196,32 +189,26 @@ cargo test
 cargo build --release --target aarch64-apple-darwin
 ```
 
-The test suite covers snapshot classification, Git behavior, manifest handling, folder navigation/collapse, diff rendering, and terminal UI snapshots. To inspect the plugin state for a specific Herdr pane, use the binary's status command:
-
-```sh
-target/aarch64-apple-darwin/release/herdr-agent-diff status --pane <pane-id>
-```
-
-The event and viewer commands are normally invoked by Herdr through the plugin manifest. They can be run directly only when the corresponding Herdr environment variables are present.
+The test suite covers working-tree Git changes, unpushed commits, workspace scanning, safe reads, viewer mappings, folder navigation/collapse, diff rendering, and terminal UI behavior.
 
 ## Troubleshooting
 
-### The viewer is empty
+### The Git diff view is empty
 
-Confirm that the agent pane was detected after the plugin was linked. Restart the agent pane if necessary, then open the viewer again. Agent mode only shows changes made after the baseline event.
+Verify that the workspace is a Git repository with an initial commit (`HEAD`). Git diff includes staged, unstaged, and untracked changes, but ignored files are intentionally excluded.
 
-### Git mode has no results
+### The Unpushed commits view is unavailable
 
-Verify that the workspace is a Git repository with an initial commit (`HEAD`). Remember that Git mode and Agent mode have different comparison points.
+Verify that the current branch tracks a remote branch. Run `git push -u <remote> <branch>` once to establish the upstream, then refresh the viewer.
 
 ### A file is not shown
 
-Check whether it is ignored, a symbolic link, binary/invalid UTF-8, larger than the configured snapshot limits, or inside an excluded/generated directory. Large or binary files may still appear as metadata-only changes rather than inline code diffs.
+Check whether it is ignored, a symbolic link, binary/invalid UTF-8, larger than the configured limits, or inside an excluded/generated directory. Large or binary files may still appear in the Changes sidebar as metadata-only diffs.
 
 ### The plugin does not appear in Herdr
 
-Re-run `herdr plugin link "$PWD"`, confirm that the release build succeeds, and restart Herdr or the affected agent pane. Check that the installed Herdr version satisfies the minimum version in `herdr-plugin.toml`.
+Re-run `herdr plugin link "$PWD"`, confirm that the release build succeeds, and restart Herdr or the affected pane. Check that the installed Herdr version satisfies the minimum version in `herdr-plugin.toml`.
 
 ## Privacy and security
 
-Herdr Agent Diff is designed for local inspection. It does not embed credentials, send source files to an external service, or mutate the workspace. Git subprocesses are invoked with lock-free read behavior and fixed read-only arguments. Even so, the viewer displays workspace contents to whoever can access the local Herdr session, so use the same care you would use with any terminal showing source code.
+Herdr Agent Diff is designed for local inspection. It does not embed credentials, send source files to an external service, or mutate the workspace. Git subprocesses are invoked with lock-free read behavior and fixed read-only arguments. The viewer displays workspace contents to whoever can access the local Herdr session, so use the same care as with any terminal showing source code.

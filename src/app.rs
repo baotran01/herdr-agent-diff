@@ -29,16 +29,17 @@ use ratatui::widgets::{
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::diff::{DiffLine, DiffLineKind, render_change};
-use crate::git::{GitChange, diff as render_git_diff, scan as scan_git};
+use crate::diff::{DiffLine, DiffLineKind};
+use crate::git::{
+    GitChange, GitComparison, GitFileState, diff as render_git_diff, scan as scan_git,
+};
 use crate::herdr::{Herdr, pane_exists};
-use crate::model::{Change, ChangeKind, CurrentFile, Manifest, TextEligibility};
-use crate::snapshot::{classify, safe_read, scan};
-use crate::state::StateStore;
+use crate::model::{ChangeKind, CurrentFile, TextEligibility};
+use crate::snapshot::{safe_read, scan};
 use crate::{Error, Result};
 
 const CACHE_LIMIT: usize = 32 * 1024 * 1024;
@@ -55,6 +56,13 @@ const DIFF_LINE_NUMBER: Color = Color::Rgb(105, 137, 177);
 const DIFF_ADDITION: Color = Color::Rgb(105, 224, 150);
 const DIFF_DELETION: Color = Color::Rgb(246, 120, 134);
 const DIFF_HUNK: Color = Color::Rgb(149, 180, 224);
+const FILE_ICON_SLOT_WIDTH: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIcon {
+    glyph: &'static str,
+    color: Color,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Tab {
@@ -64,15 +72,22 @@ enum Tab {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChangesMode {
-    Agent,
     Git,
+    Unpushed,
 }
 
 impl ChangesMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Agent => "Agent diff",
             Self::Git => "Git diff",
+            Self::Unpushed => "Unpushed commits",
+        }
+    }
+
+    fn comparison(self) -> GitComparison {
+        match self {
+            Self::Git => GitComparison::WorkingTree,
+            Self::Unpushed => GitComparison::Unpushed,
         }
     }
 }
@@ -125,11 +140,19 @@ enum Mode {
     Filter,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationGroupKind {
+    Status,
+    Folder,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NavigationRow {
     Group {
         path: PathBuf,
         label: String,
+        depth: usize,
+        kind: NavigationGroupKind,
     },
     File {
         index: usize,
@@ -145,6 +168,45 @@ struct TabState {
     scroll_y: usize,
     scroll_x: usize,
     filter: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FileSearchIndex {
+    file_names: Vec<String>,
+    relative_paths: Vec<String>,
+}
+
+impl FileSearchIndex {
+    fn from_files(files: &[CurrentFile]) -> Self {
+        Self {
+            file_names: files
+                .iter()
+                .map(|file| {
+                    file.relative
+                        .file_name()
+                        .map_or_else(
+                            || file.relative.to_string_lossy().into_owned(),
+                            |name| name.to_string_lossy().into_owned(),
+                        )
+                        .to_lowercase()
+                })
+                .collect(),
+            relative_paths: files
+                .iter()
+                .map(|file| file.relative.to_string_lossy().to_lowercase())
+                .collect(),
+        }
+    }
+
+    fn matches(&self, index: usize, needle: &str) -> bool {
+        self.file_names
+            .get(index)
+            .is_some_and(|file_name| file_name.contains(needle))
+            || self
+                .relative_paths
+                .get(index)
+                .is_some_and(|relative_path| relative_path.contains(needle))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -185,11 +247,6 @@ type DiffView<'a> = (
 
 enum Task {
     Scan(u64),
-    Diff {
-        generation: u64,
-        index: usize,
-        change: Change,
-    },
     Highlight {
         generation: u64,
         index: usize,
@@ -197,6 +254,7 @@ enum Task {
     },
     GitScan {
         generation: u64,
+        comparison: GitComparison,
     },
     GitDiff {
         generation: u64,
@@ -207,21 +265,13 @@ enum Task {
 
 struct ScanResult {
     generation: u64,
-    baseline: Option<Manifest>,
-    capturing: bool,
     files: Vec<CurrentFile>,
-    changes: Vec<Change>,
     notices: Vec<String>,
     error: Option<String>,
 }
 
 enum WorkResult {
     Scan(Box<ScanResult>),
-    Diff {
-        generation: u64,
-        index: usize,
-        lines: Vec<DiffLine>,
-    },
     Highlight {
         generation: u64,
         index: usize,
@@ -282,13 +332,7 @@ impl<K: Eq, V> Cache<K, V> {
     }
 }
 
-pub fn run(
-    store: &StateStore,
-    manifest: Option<Manifest>,
-    root: &Path,
-    target_pane_id: String,
-    herdr: &impl Herdr,
-) -> Result<()> {
+pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()> {
     let canonical_root = root.canonicalize()?;
     let (watch_tx, watch_rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -303,9 +347,7 @@ pub fn run(
     let (task_tx, task_rx) = mpsc::sync_channel(8);
     let (result_tx, result_rx) = mpsc::channel();
     spawn_worker(
-        store.clone(),
         canonical_root.clone(),
-        target_pane_id.clone(),
         Arc::clone(&newest_generation),
         task_rx,
         result_tx,
@@ -315,14 +357,12 @@ pub fn run(
         .map_err(|_| Error::Message("background worker stopped".into()))?;
 
     let mut terminal = TerminalSession::start()?;
-    let capturing = store.capturing(&target_pane_id);
-    let mut app = App::new(manifest, capturing, target_pane_id);
+    let mut app = App::new(target_pane_id);
     if let Some(notice) = watcher_notice {
         app.notices.push(notice);
     }
     let mut dirty_since: Option<Instant> = None;
     let mut last_liveness = Instant::now();
-    let mut last_capture_poll = Instant::now();
 
     loop {
         while let Ok(result) = result_rx.try_recv() {
@@ -344,10 +384,6 @@ pub fn run(
             app.refresh(&newest_generation, &task_tx);
             dirty_since = None;
         }
-        if app.capturing && last_capture_poll.elapsed() >= Duration::from_millis(250) {
-            app.refresh(&newest_generation, &task_tx);
-            last_capture_poll = Instant::now();
-        }
         if last_liveness.elapsed() >= Duration::from_secs(2) {
             if !pane_exists(herdr, &app.target_pane_id) {
                 break;
@@ -360,7 +396,9 @@ pub fn run(
             match event::read()? {
                 Event::Key(key) if app.handle_key(key, &newest_generation, &task_tx) => break,
                 Event::Mouse(mouse) => app.handle_mouse(mouse, &newest_generation, &task_tx),
-                Event::FocusGained => app.refresh(&newest_generation, &task_tx),
+                Event::FocusGained => {
+                    app.refresh(&newest_generation, &task_tx);
+                }
                 _ => {}
             }
         }
@@ -437,22 +475,20 @@ impl Drop for TerminalSession {
 struct App {
     tab: Tab,
     changes_mode: ChangesMode,
+    sidebar_visible: bool,
     focus: Focus,
     changes_state: TabState,
     files_state: TabState,
-    manifest: Option<Manifest>,
     target_pane_id: String,
-    changes: Vec<Change>,
     git_changes: Vec<GitChange>,
     files: Vec<CurrentFile>,
+    file_search_index: FileSearchIndex,
     notices: Vec<String>,
     loading: bool,
-    capturing: bool,
     mode: Mode,
     generation: u64,
     render_generation: u64,
     requested: BTreeSet<(Tab, usize, u64)>,
-    diff_cache: Cache<usize, Vec<DiffLine>>,
     git_diff_cache: Cache<usize, Vec<DiffLine>>,
     source_cache: Cache<usize, Vec<Vec<ColoredSpan>>>,
     source_notices: Cache<usize, String>,
@@ -468,26 +504,24 @@ struct App {
 }
 
 impl App {
-    fn new(manifest: Option<Manifest>, capturing: bool, target_pane_id: String) -> Self {
+    fn new(target_pane_id: String) -> Self {
         Self {
             tab: Tab::Changes,
-            changes_mode: ChangesMode::Agent,
+            changes_mode: ChangesMode::Git,
+            sidebar_visible: true,
             focus: Focus::Navigation,
             changes_state: TabState::default(),
             files_state: TabState::default(),
-            manifest,
             target_pane_id,
-            changes: Vec::new(),
             git_changes: Vec::new(),
             files: Vec::new(),
+            file_search_index: FileSearchIndex::default(),
             notices: Vec::new(),
             loading: true,
-            capturing,
             mode: Mode::Normal,
             generation: 1,
             render_generation: 0,
             requested: BTreeSet::new(),
-            diff_cache: Cache::new(),
             git_diff_cache: Cache::new(),
             source_cache: Cache::new(),
             source_notices: Cache::new(),
@@ -507,10 +541,7 @@ impl App {
         match result {
             WorkResult::Scan(result) if result.generation == self.generation => {
                 let ScanResult {
-                    baseline,
-                    capturing,
                     files,
-                    changes,
                     notices,
                     error,
                     ..
@@ -518,11 +549,8 @@ impl App {
                 self.render_generation = self.render_generation.saturating_add(1);
                 self.requested.clear();
                 if error.is_none() {
-                    self.manifest = baseline;
-                    self.capturing = capturing;
                     self.files = files;
-                    self.changes = changes;
-                    self.diff_cache.clear();
+                    self.file_search_index = FileSearchIndex::from_files(&self.files);
                     self.source_cache.clear();
                     self.source_notices.clear();
                     self.git_changes.clear();
@@ -534,15 +562,6 @@ impl App {
                 self.scan_error = error;
                 self.notices = notices;
                 self.loading = false;
-            }
-            WorkResult::Diff {
-                generation,
-                index,
-                lines,
-            } if generation == self.render_generation => {
-                let bytes = lines.iter().map(|line| line.text.len()).sum();
-                self.diff_cache.insert(index, lines, bytes);
-                self.requested.remove(&(Tab::Changes, index, generation));
             }
             WorkResult::Highlight {
                 generation,
@@ -585,9 +604,9 @@ impl App {
         }
     }
 
-    fn refresh(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) {
+    fn refresh(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) -> bool {
         if self.loading {
-            return;
+            return false;
         }
         let generation = self.generation.saturating_add(1);
         if tasks.try_send(Task::Scan(generation)).is_ok() {
@@ -600,6 +619,9 @@ impl App {
             self.git_diff_cache.clear();
             self.git_error = None;
             self.git_state = GitState::Unloaded;
+            true
+        } else {
+            false
         }
     }
 
@@ -607,17 +629,20 @@ impl App {
         if self.loading {
             return;
         }
-        if self.tab == Tab::Changes
-            && self.changes_mode == ChangesMode::Git
-            && self.git_state != GitState::Loaded
-        {
+        if self.tab == Tab::Changes && self.git_state != GitState::Loaded {
             if self.git_state == GitState::Loading {
                 return;
             }
             self.render_generation = self.render_generation.saturating_add(1);
             let generation = self.render_generation;
             self.requested.clear();
-            if tasks.try_send(Task::GitScan { generation }).is_ok() {
+            if tasks
+                .try_send(Task::GitScan {
+                    generation,
+                    comparison: self.changes_mode.comparison(),
+                })
+                .is_ok()
+            {
                 self.git_state = GitState::Loading;
             }
             return;
@@ -632,9 +657,6 @@ impl App {
             return;
         }
         let needs_task = match self.tab {
-            Tab::Changes if self.changes_mode == ChangesMode::Agent => {
-                self.diff_cache.get(&selected).is_none()
-            }
             Tab::Changes => self.git_diff_cache.get(&selected).is_none(),
             Tab::Files => self.source_cache.get(&selected).is_none(),
         };
@@ -646,19 +668,6 @@ impl App {
         let generation = self.render_generation;
         self.requested.clear();
         match self.tab {
-            Tab::Changes if self.changes_mode == ChangesMode::Agent => {
-                if let Some(change) = self.changes.get(selected).cloned()
-                    && tasks
-                        .try_send(Task::Diff {
-                            generation,
-                            index: selected,
-                            change,
-                        })
-                        .is_ok()
-                {
-                    self.requested.insert((Tab::Changes, selected, generation));
-                }
-            }
             Tab::Changes => {
                 if let Some(change) = self.git_changes.get(selected).cloned()
                     && tasks
@@ -693,14 +702,26 @@ impl App {
             return;
         }
         self.changes_mode = match self.changes_mode {
-            ChangesMode::Agent => ChangesMode::Git,
-            ChangesMode::Git => ChangesMode::Agent,
+            ChangesMode::Git => ChangesMode::Unpushed,
+            ChangesMode::Unpushed => ChangesMode::Git,
         };
         self.changes_state.selected = 0;
         self.changes_state.scroll_y = 0;
         self.changes_state.scroll_x = 0;
         self.render_generation = self.render_generation.saturating_add(1);
         self.requested.clear();
+        self.git_changes.clear();
+        self.git_diff_cache.clear();
+        self.git_error = None;
+        self.git_state = GitState::Unloaded;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.scrollbar_drag = None;
+        if !self.sidebar_visible {
+            self.focus = Focus::Content;
+        }
     }
 
     fn handle_key(
@@ -758,14 +779,21 @@ impl App {
                     self.selection = None;
                 }
             }
+            KeyCode::Char('b') => self.toggle_sidebar(),
             KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Navigation => Focus::Content,
-                    Focus::Content => Focus::Navigation,
-                };
+                if self.sidebar_visible {
+                    self.focus = match self.focus {
+                        Focus::Navigation => Focus::Content,
+                        Focus::Content => Focus::Navigation,
+                    };
+                } else {
+                    self.focus = Focus::Content;
+                }
             }
             KeyCode::Char('/') => self.mode = Mode::Filter,
-            KeyCode::Char('r') => self.refresh(newest, tasks),
+            KeyCode::Char('r') => {
+                self.refresh(newest, tasks);
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_vertical(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_vertical(1),
             KeyCode::Left | KeyCode::Char('h') => {
@@ -811,15 +839,9 @@ impl App {
     }
 
     fn clamp_selections(&mut self) {
-        let change_count = match self.changes_mode {
-            ChangesMode::Agent => {
-                filtered_change_indices(&self.changes, &self.changes_state.filter).len()
-            }
-            ChangesMode::Git => {
-                filtered_git_indices(&self.git_changes, &self.changes_state.filter).len()
-            }
-        };
-        let file_count = filtered_file_indices(&self.files, &self.files_state.filter).len();
+        let change_count =
+            filtered_git_indices(&self.git_changes, &self.changes_state.filter).len();
+        let file_count = self.filtered_file_indices().len();
         self.changes_state.selected = self
             .changes_state
             .selected
@@ -843,12 +865,21 @@ impl App {
 
     fn filtered_indices(&self) -> Vec<usize> {
         match self.tab {
-            Tab::Changes if self.changes_mode == ChangesMode::Agent => {
-                filtered_change_indices(&self.changes, &self.changes_state.filter)
-            }
             Tab::Changes => filtered_git_indices(&self.git_changes, &self.changes_state.filter),
-            Tab::Files => filtered_file_indices(&self.files, &self.files_state.filter),
+            Tab::Files => self.filtered_file_indices(),
         }
+    }
+
+    fn filtered_file_indices(&self) -> Vec<usize> {
+        let needle = self.files_state.filter.to_lowercase();
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                needle.is_empty() || self.file_search_index.matches(*index, &needle)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn actual_selected(&self) -> Option<usize> {
@@ -868,6 +899,8 @@ impl App {
             .split(area);
         let (navigation, content) = if self.mode == Mode::Help {
             (None, None)
+        } else if !self.sidebar_visible {
+            (None, Some(vertical[1]))
         } else if area.width < 56 {
             match self.focus {
                 Focus::Navigation => (Some(vertical[1]), None),
@@ -1087,16 +1120,14 @@ impl App {
 
     fn navigation_rows(&self) -> Vec<NavigationRow> {
         let indices = self.filtered_indices();
+        if self.tab == Tab::Changes {
+            return self.git_navigation_rows(indices);
+        }
+
         let mut rows = Vec::with_capacity(indices.len().saturating_mul(2));
         let mut current_group = None;
         for index in indices {
-            let path = match self.tab {
-                Tab::Changes => match self.changes_mode {
-                    ChangesMode::Agent => self.changes[index].path.as_path(),
-                    ChangesMode::Git => self.git_changes[index].path.as_path(),
-                },
-                Tab::Files => self.files[index].relative.as_path(),
-            };
+            let path = self.files[index].relative.as_path();
             let group = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -1106,6 +1137,8 @@ impl App {
                     rows.push(NavigationRow::Group {
                         path: group.clone(),
                         label: format!("{}/", group.display()),
+                        depth: 0,
+                        kind: NavigationGroupKind::Folder,
                     });
                 }
                 current_group.clone_from(&group);
@@ -1129,17 +1162,76 @@ impl App {
         rows
     }
 
+    fn git_navigation_rows(&self, indices: Vec<usize>) -> Vec<NavigationRow> {
+        let mut rows = Vec::with_capacity(indices.len().saturating_mul(3));
+        let mut current_state = None;
+        let mut current_group = None;
+        let mut state_collapsed = false;
+        let mut group_collapsed = false;
+
+        for index in indices {
+            let change = &self.git_changes[index];
+            if current_state != Some(change.state) {
+                let path = git_state_group_path(change.state);
+                rows.push(NavigationRow::Group {
+                    path: path.clone(),
+                    label: format!("{}/", change.state.label()),
+                    depth: 0,
+                    kind: NavigationGroupKind::Status,
+                });
+                current_state = Some(change.state);
+                current_group = None;
+                state_collapsed = self.group_collapsed(&path);
+                group_collapsed = false;
+            }
+            if state_collapsed {
+                continue;
+            }
+
+            let group = change
+                .path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf);
+            if group != current_group {
+                current_group.clone_from(&group);
+                if let Some(group) = &group {
+                    let path = git_folder_group_path(change.state, group);
+                    rows.push(NavigationRow::Group {
+                        path: path.clone(),
+                        label: format!("{}/", group.display()),
+                        depth: 1,
+                        kind: NavigationGroupKind::Folder,
+                    });
+                    group_collapsed = self.group_collapsed(&path);
+                } else {
+                    group_collapsed = false;
+                }
+            }
+            if group_collapsed {
+                continue;
+            }
+
+            let label = change.path.file_name().map_or_else(
+                || change.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            rows.push(NavigationRow::File {
+                index,
+                label,
+                depth: usize::from(group.is_some()).saturating_add(1),
+            });
+        }
+        rows
+    }
+
     fn navigation_stats(&self, index: usize) -> Option<(usize, usize)> {
         if self.tab != Tab::Changes {
             return None;
         }
-        match self.changes_mode {
-            ChangesMode::Agent => self.diff_cache.get(&index).map(|lines| diff_stats(lines)),
-            ChangesMode::Git => self
-                .git_diff_cache
-                .get(&index)
-                .map(|lines| diff_stats(lines)),
-        }
+        self.git_diff_cache
+            .get(&index)
+            .map(|lines| diff_stats(lines))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1490,7 +1582,7 @@ impl App {
                 self.notices.len()
             )
         } else {
-            "g: Git diff / Agent  click folders  drag scrollbars  Tab focus  / filter  ? help  q close".into()
+            "b: sidebar  g: Git diff / Unpushed  click folders  drag scrollbars  Tab focus  / filter  ? help  q close".into()
         };
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -1577,16 +1669,28 @@ impl App {
             Style::default()
         };
         match row {
-            NavigationRow::Group { path, label } => {
+            NavigationRow::Group {
+                path,
+                label,
+                depth,
+                kind,
+            } => {
                 let marker = if self.group_collapsed(path) {
                     "▸ "
                 } else {
                     "▾ "
                 };
+                let color = match kind {
+                    NavigationGroupKind::Status => Color::Yellow,
+                    NavigationGroupKind::Folder => Color::Cyan,
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(gutter, gutter_style),
-                    Span::styled(marker, Style::default().fg(Color::Cyan)),
-                    Span::styled(label.clone(), Style::default().fg(Color::Cyan).bold()),
+                    Span::styled(
+                        format!("{}{marker}", "  ".repeat(*depth)),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(label.clone(), Style::default().fg(color).bold()),
                 ]))
             }
             NavigationRow::File {
@@ -1595,38 +1699,45 @@ impl App {
                 depth,
             } => {
                 let (symbol, color) = if self.tab == Tab::Changes {
-                    let kind = match self.changes_mode {
-                        ChangesMode::Agent => self.changes[*index].kind,
-                        ChangesMode::Git => self.git_changes[*index].kind,
-                    };
+                    let kind = self.git_changes[*index].kind;
                     change_symbol(kind)
                 } else {
                     ("·", Color::DarkGray)
                 };
                 let stats = self.navigation_stats(*index);
                 let stats_width = stats.map_or(0, |(additions, deletions)| {
-                    format!("+{additions} -{deletions}").len()
+                    format!("+{additions} -{deletions}").width()
                 });
                 let prefix = if self.tab == Tab::Changes {
                     format!("{gutter}{}{} ", "  ".repeat(*depth), symbol)
                 } else {
                     format!("{gutter}{}", "  ".repeat(*depth))
                 };
+                let icon =
+                    (self.tab == Tab::Files).then(|| file_icon(&self.files[*index].relative));
+                let icon_width = icon.map_or(0, |_| FILE_ICON_SLOT_WIDTH);
+                let prefix_width = prefix.width().saturating_add(icon_width);
                 let name_width = row_width
-                    .saturating_sub(prefix.len())
+                    .saturating_sub(prefix_width)
                     .saturating_sub(stats_width)
                     .saturating_sub(1);
                 let label = truncate_label(label, name_width);
                 let padding = row_width
-                    .saturating_sub(prefix.len())
-                    .saturating_sub(label.len())
+                    .saturating_sub(prefix_width)
+                    .saturating_sub(label.width())
                     .saturating_sub(stats_width)
                     .max(1);
-                let mut spans = vec![
-                    Span::styled(prefix, Style::default().fg(color).bold()),
-                    Span::raw(label),
-                    Span::raw(" ".repeat(padding)),
-                ];
+                let mut spans = vec![Span::styled(prefix, Style::default().fg(color).bold())];
+                if let Some(icon) = icon {
+                    spans.push(Span::styled(
+                        icon.glyph,
+                        Style::default().fg(icon.color).bold(),
+                    ));
+                    spans.push(Span::raw(
+                        " ".repeat(FILE_ICON_SLOT_WIDTH.saturating_sub(icon.glyph.width())),
+                    ));
+                }
+                spans.extend([Span::raw(label), Span::raw(" ".repeat(padding))]);
                 if let Some((additions, deletions)) = stats {
                     spans.push(Span::styled(
                         format!("+{additions}"),
@@ -1668,10 +1779,14 @@ impl App {
                         self.filtered_indices().len()
                     )
                 }
-                Tab::Files => " Files ".to_owned(),
+                Tab::Files => format!(" Files · {} files ", self.filtered_indices().len()),
             }
         } else {
-            format!(" /{} ", self.active_state().filter)
+            format!(
+                " /{} · {} files ",
+                self.active_state().filter,
+                self.filtered_indices().len()
+            )
         };
         let list = List::new(items)
             .style(panel)
@@ -1705,10 +1820,7 @@ impl App {
             Tab::Changes => self.actual_selected().map_or_else(
                 || format!(" {} ", self.changes_mode.label()),
                 |selected| {
-                    let path = match self.changes_mode {
-                        ChangesMode::Agent => &self.changes[selected].path,
-                        ChangesMode::Git => &self.git_changes[selected].path,
-                    };
+                    let path = &self.git_changes[selected].path;
                     format!(" {} — {} ", self.changes_mode.label(), path.display())
                 },
             ),
@@ -1726,20 +1838,17 @@ impl App {
                 format!("Unable to scan filesystem.\n\n{error}\n\nPress r to retry.")
             } else if self.loading {
                 "Scanning filesystem…".into()
-            } else if self.tab == Tab::Changes && self.changes_mode == ChangesMode::Git {
-                if let Some(error) = &self.git_error {
-                    format!("Git diff unavailable.\n\n{error}")
-                } else if self.git_state != GitState::Loaded {
-                    "Reading Git status…".into()
-                } else {
-                    "No uncommitted Git changes.".into()
-                }
-            } else if self.capturing && self.tab == Tab::Changes {
-                "Capturing baseline…\n\nChanges will become available when capture completes.\nFiles remains available.".into()
-            } else if self.manifest.is_none() && self.tab == Tab::Changes {
-                "No baseline exists.\n\nRestart this agent to capture changes from session start.\nFiles remains available.".into()
             } else if self.tab == Tab::Changes {
-                "No filesystem changes since this session began.".into()
+                if let Some(error) = &self.git_error {
+                    format!("{} unavailable.\n\n{error}", self.changes_mode.label())
+                } else if self.git_state != GitState::Loaded {
+                    format!("Reading {}…", self.changes_mode.label())
+                } else {
+                    match self.changes_mode {
+                        ChangesMode::Git => "No local Git changes.".into(),
+                        ChangesMode::Unpushed => "No unpushed commits.".into(),
+                    }
+                }
             } else {
                 "No readable files.".into()
             };
@@ -1758,26 +1867,13 @@ impl App {
     }
 
     fn selected_diff(&self, selected: usize) -> Option<DiffView<'_>> {
-        match self.changes_mode {
-            ChangesMode::Agent => {
-                let change = self.changes.get(selected)?;
-                Some((
-                    change.kind,
-                    &change.path,
-                    change.old_path.as_deref(),
-                    self.diff_cache.get(&selected).map(Vec::as_slice),
-                ))
-            }
-            ChangesMode::Git => {
-                let change = self.git_changes.get(selected)?;
-                Some((
-                    change.kind,
-                    &change.path,
-                    change.old_path.as_deref(),
-                    self.git_diff_cache.get(&selected).map(Vec::as_slice),
-                ))
-            }
-        }
+        let change = self.git_changes.get(selected)?;
+        Some((
+            change.kind,
+            &change.path,
+            change.old_path.as_deref(),
+            self.git_diff_cache.get(&selected).map(Vec::as_slice),
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1981,9 +2077,10 @@ impl App {
     fn draw_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         frame.render_widget(
             Paragraph::new(
-                "Herdr Agent Diff\n\n\
+                "Git Changes\n\n\
                  1 / 2       Changes review / Files browser\n\
-                 g           Switch to Git diff / Agent diff in Changes\n\
+                 b           Show / hide the sidebar\n\
+                 g           Switch to Git diff / Unpushed commits in Changes\n\
                  Tab         navigation / diff or source focus\n\
                  Mouse       click folders to expand/collapse, tabs/items/content, drag scrollbars, wheel scroll, drag select\n\
                  ↑↓ or jk    select files / scroll content\n\
@@ -1993,8 +2090,9 @@ impl App {
                  ⌘C          copy selected text; mouse selections copy on release\n\
                  ?           close help\n\
                  q           close viewer\n\n\
-                 Read only. Git mode uses read-only Git commands.\n\
-                 Results are filesystem changes since this session began.",
+                 Read only. Git diff shows local changes; Unpushed shows commits ahead of @{upstream}.\n\
+                 Git diff groups files by staged, unstaged, mixed, or untracked status; empty groups are hidden.\n\
+                 Results show changes that are not yet part of the pushed branch.",
             )
             .block(Block::default().borders(Borders::ALL).title(" Help "))
             .wrap(Wrap { trim: false }),
@@ -2004,9 +2102,7 @@ impl App {
 }
 
 fn spawn_worker(
-    store: StateStore,
     root: PathBuf,
-    target_pane_id: String,
     newest_generation: Arc<AtomicU64>,
     tasks: mpsc::Receiver<Task>,
     results: mpsc::Sender<WorkResult>,
@@ -2021,29 +2117,16 @@ fn spawn_worker(
                     if newest_generation.load(Ordering::Acquire) != generation {
                         continue;
                     }
-                    let baseline = store.load_manifest(&target_pane_id).ok().flatten();
-                    let capturing = store.capturing(&target_pane_id);
                     let result = match scan(&root) {
-                        Ok((map, notices)) => {
-                            let changes = baseline
-                                .as_ref()
-                                .map_or_else(Vec::new, |baseline| classify(baseline, &map));
-                            WorkResult::Scan(Box::new(ScanResult {
-                                generation,
-                                baseline,
-                                capturing,
-                                files: map.into_values().collect(),
-                                changes,
-                                notices,
-                                error: None,
-                            }))
-                        }
+                        Ok((map, notices)) => WorkResult::Scan(Box::new(ScanResult {
+                            generation,
+                            files: map.into_values().collect(),
+                            notices,
+                            error: None,
+                        })),
                         Err(error) => WorkResult::Scan(Box::new(ScanResult {
                             generation,
-                            baseline,
-                            capturing,
                             files: Vec::new(),
-                            changes: Vec::new(),
                             notices: Vec::new(),
                             error: Some(error.to_string()),
                         })),
@@ -2052,18 +2135,6 @@ fn spawn_worker(
                         continue;
                     }
                     let _ = results.send(result);
-                }
-                Task::Diff {
-                    generation,
-                    index,
-                    change,
-                } => {
-                    let lines = render_change(&store, &root, &change);
-                    let _ = results.send(WorkResult::Diff {
-                        generation,
-                        index,
-                        lines,
-                    });
                 }
                 Task::Highlight {
                     generation,
@@ -2078,8 +2149,11 @@ fn spawn_worker(
                         notice,
                     });
                 }
-                Task::GitScan { generation } => {
-                    let _ = results.send(git_scan_result(&root, generation));
+                Task::GitScan {
+                    generation,
+                    comparison,
+                } => {
+                    let _ = results.send(git_scan_result(&root, generation, comparison));
                 }
                 Task::GitDiff {
                     generation,
@@ -2093,8 +2167,8 @@ fn spawn_worker(
     });
 }
 
-fn git_scan_result(root: &Path, generation: u64) -> WorkResult {
-    match scan_git(root) {
+fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> WorkResult {
+    match scan_git(root, comparison) {
         Ok(changes) => WorkResult::GitScan {
             generation,
             changes,
@@ -2148,11 +2222,7 @@ fn highlight_file(
     let Ok(text) = String::from_utf8(bytes) else {
         return (Vec::new(), Some("file is not valid UTF-8".into()));
     };
-    let syntax = syntaxes
-        .find_syntax_for_file(&file.relative)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    let syntax = syntax_for_file(root, &file.relative, syntaxes);
     let default_foreground = theme.settings.foreground;
     let mut highlighter = HighlightLines::new(syntax, theme);
     let lines = LinesWithEndings::from(&text)
@@ -2175,26 +2245,33 @@ fn highlight_file(
     (lines, None)
 }
 
-fn filtered_change_indices(changes: &[Change], filter: &str) -> Vec<usize> {
-    let needle = filter.to_ascii_lowercase();
-    changes
-        .iter()
-        .enumerate()
-        .filter(|(_, change)| {
-            needle.is_empty()
-                || change
-                    .path
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains(&needle)
-        })
-        .map(|(index, _)| index)
-        .collect()
+fn syntax_for_file<'a>(
+    root: &Path,
+    relative: &Path,
+    syntaxes: &'a SyntaxSet,
+) -> &'a SyntaxReference {
+    let syntax = match relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jsx")
+                || extension.eq_ignore_ascii_case("tsx")
+                || extension.eq_ignore_ascii_case("ts") =>
+        {
+            syntaxes.find_syntax_by_token("JavaScript")
+        }
+        _ => syntaxes
+            .find_syntax_for_file(root.join(relative))
+            .ok()
+            .flatten(),
+    };
+    syntax.unwrap_or_else(|| syntaxes.find_syntax_plain_text())
 }
 
 fn filtered_git_indices(changes: &[GitChange], filter: &str) -> Vec<usize> {
     let needle = filter.to_ascii_lowercase();
-    changes
+    let mut indices: Vec<usize> = changes
         .iter()
         .enumerate()
         .filter(|(_, change)| {
@@ -2212,24 +2289,27 @@ fn filtered_git_indices(changes: &[GitChange], filter: &str) -> Vec<usize> {
                 })
         })
         .map(|(index, _)| index)
-        .collect()
+        .collect();
+    indices.sort_by_key(|index| git_state_rank(changes[*index].state));
+    indices
 }
 
-fn filtered_file_indices(files: &[CurrentFile], filter: &str) -> Vec<usize> {
-    let needle = filter.to_ascii_lowercase();
-    files
-        .iter()
-        .enumerate()
-        .filter(|(_, file)| {
-            needle.is_empty()
-                || file
-                    .relative
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .contains(&needle)
-        })
-        .map(|(index, _)| index)
-        .collect()
+fn git_state_rank(state: GitFileState) -> u8 {
+    match state {
+        GitFileState::Staged => 0,
+        GitFileState::Unstaged => 1,
+        GitFileState::StagedAndUnstaged => 2,
+        GitFileState::Untracked => 3,
+        GitFileState::Committed => 4,
+    }
+}
+
+fn git_state_group_path(state: GitFileState) -> PathBuf {
+    PathBuf::from(".herdr-git-status").join(state.label())
+}
+
+fn git_folder_group_path(state: GitFileState, folder: &Path) -> PathBuf {
+    git_state_group_path(state).join("folders").join(folder)
 }
 
 fn contains(area: Rect, column: u16, row: u16) -> bool {
@@ -2392,6 +2472,59 @@ fn change_symbol(kind: ChangeKind) -> (&'static str, Color) {
         ChangeKind::Deleted => ("D", Color::Red),
         ChangeKind::Renamed => ("R", Color::Cyan),
     }
+}
+
+fn file_icon(path: &Path) -> FileIcon {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if matches!(name, "Dockerfile" | "Containerfile") {
+        return file_icon_badge("DO", Color::Rgb(36, 150, 237));
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    extension
+        .as_deref()
+        .and_then(file_icon_for_extension)
+        .unwrap_or_else(|| file_icon_badge("··", Color::DarkGray))
+}
+
+fn file_icon_badge(glyph: &'static str, color: Color) -> FileIcon {
+    FileIcon { glyph, color }
+}
+
+fn file_icon_for_extension(extension: &str) -> Option<FileIcon> {
+    let icon = match extension {
+        "rs" => file_icon_badge("RS", Color::Rgb(222, 165, 132)),
+        "ts" => file_icon_badge("TS", Color::Rgb(49, 120, 198)),
+        "tsx" => file_icon_badge("⚛", Color::Rgb(97, 218, 251)),
+        "js" | "jsx" | "mjs" | "cjs" => file_icon_badge("JS", Color::Rgb(247, 223, 30)),
+        "py" | "pyw" => file_icon_badge("PY", Color::Rgb(55, 118, 171)),
+        "go" => file_icon_badge("GO", Color::Rgb(0, 173, 216)),
+        "rb" => file_icon_badge("RB", Color::Rgb(204, 52, 45)),
+        "php" => file_icon_badge("PH", Color::Rgb(119, 123, 180)),
+        "java" => file_icon_badge("JV", Color::Rgb(248, 152, 32)),
+        "kt" | "kts" => file_icon_badge("KT", Color::Rgb(127, 82, 255)),
+        "swift" => file_icon_badge("SW", Color::Rgb(240, 81, 56)),
+        "c" => file_icon_badge("C", Color::Rgb(85, 132, 181)),
+        "h" | "hpp" | "hh" => file_icon_badge("C#", Color::Rgb(101, 155, 211)),
+        "cc" | "cpp" | "cxx" => file_icon_badge("C+", Color::Rgb(0, 89, 156)),
+        "cs" => file_icon_badge("C#", Color::Rgb(104, 33, 122)),
+        "html" | "htm" => file_icon_badge("<>", Color::Rgb(227, 76, 38)),
+        "css" | "scss" | "sass" | "less" => file_icon_badge("#.", Color::Rgb(38, 77, 228)),
+        "json" | "jsonc" | "json5" => file_icon_badge("{}", Color::Rgb(240, 180, 41)),
+        "toml" => file_icon_badge("TM", Color::Rgb(156, 39, 176)),
+        "yaml" | "yml" => file_icon_badge("YM", Color::Rgb(203, 56, 55)),
+        "md" | "mdx" => file_icon_badge("MD", Color::Rgb(83, 174, 85)),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" => file_icon_badge("SH", Color::Rgb(137, 180, 72)),
+        "sql" => file_icon_badge("DB", Color::Rgb(0, 150, 136)),
+        _ => return None,
+    };
+    Some(icon)
 }
 
 fn diff_stats(lines: &[DiffLine]) -> (usize, usize) {
@@ -2680,6 +2813,7 @@ fn brighten_code_component(value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2689,13 +2823,15 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use tempfile::TempDir;
+    use unicode_width::UnicodeWidthStr;
 
     use super::{
-        App, Cache, ChangesMode, Focus, Tab, Task, WorkResult, brighten_code_component,
-        highlight_file, saturating_u16,
+        App, Cache, ChangesMode, FileSearchIndex, Focus, Tab, Task, WorkResult,
+        brighten_code_component, file_icon, highlight_file, saturating_u16, syntax_for_file,
     };
     use crate::diff::{DiffLine, DiffLineKind};
-    use crate::model::{Change, ChangeKind, CurrentFile, TextEligibility};
+    use crate::git::{GitChange, GitComparison, GitFileState};
+    use crate::model::{ChangeKind, CurrentFile, TextEligibility};
     use crate::snapshot::scan;
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -2728,56 +2864,45 @@ mod tests {
             absolute: path.into(),
             size: 0,
             modified_unix_ns: None,
-            hash: None,
             text: TextEligibility::Text,
         }
     }
 
-    fn change(path: &str, kind: ChangeKind) -> Change {
-        Change {
+    fn git_change(path: &str, kind: ChangeKind) -> GitChange {
+        GitChange {
             kind,
             path: path.into(),
             old_path: None,
-            baseline: None,
-            current: None,
+            untracked: false,
+            comparison: GitComparison::WorkingTree,
+            state: GitFileState::Unstaged,
         }
     }
 
     #[test]
-    fn missing_baseline_keeps_files_tab_available() {
-        let mut app = App::new(None, false, "w1:p1".into());
-        app.apply_result(WorkResult::Scan(Box::new(super::ScanResult {
-            generation: 1,
-            baseline: None,
-            capturing: false,
-            files: Vec::new(),
-            changes: Vec::new(),
-            notices: Vec::new(),
-            error: None,
-        })));
-        app.focus = Focus::Content;
-        let changes = render(&mut app, 80, 18);
-        assert!(changes.contains("Restart this agent"));
-        app.tab = Tab::Files;
-        let files = render(&mut app, 80, 18);
-        assert!(files.contains("No readable files."));
-    }
-
-    #[test]
-    fn capture_in_progress_has_a_distinct_nonfatal_view() {
-        let mut app = App::new(None, true, "w1:p1".into());
-        app.loading = false;
-        app.focus = Focus::Content;
-        let output = render(&mut app, 80, 14);
-        assert!(output.contains("Capturing baseline"));
-    }
-
-    #[test]
-    fn g_switches_changes_between_agent_and_git_modes() {
-        let mut app = App::new(None, false, "w1:p1".into());
+    fn changes_start_in_git_mode_and_g_toggles_to_unpushed() {
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         let (tasks, queued) = std::sync::mpsc::sync_channel(8);
         let newest = std::sync::atomic::AtomicU64::new(1);
+
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+
+        assert_eq!(app.changes_mode, ChangesMode::Unpushed);
+        assert_eq!(app.git_state, super::GitState::Loading);
+        assert!(matches!(
+            queued.try_recv(),
+            Ok(Task::GitScan {
+                comparison: GitComparison::Unpushed,
+                ..
+            })
+        ));
 
         app.handle_key(
             KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
@@ -2787,35 +2912,69 @@ mod tests {
 
         assert_eq!(app.changes_mode, ChangesMode::Git);
         assert_eq!(app.git_state, super::GitState::Loading);
-        assert!(matches!(queued.try_recv(), Ok(Task::GitScan { .. })));
+        assert!(matches!(
+            queued.try_recv(),
+            Ok(Task::GitScan {
+                comparison: GitComparison::WorkingTree,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn b_toggles_sidebar_for_changes_and_files_tabs() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.viewport = Rect::new(0, 0, 100, 20);
+        let (tasks, _) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+
+        for tab in [Tab::Changes, Tab::Files] {
+            app.tab = tab;
+            app.sidebar_visible = true;
+            app.focus = Focus::Navigation;
+            assert!(app.ui_layout(app.viewport).navigation.is_some());
+
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+
+            let hidden_layout = app.ui_layout(app.viewport);
+            assert!(!app.sidebar_visible);
+            assert_eq!(app.focus, Focus::Content);
+            assert!(hidden_layout.navigation.is_none());
+            assert_eq!(hidden_layout.content.map(|area| area.width), Some(100));
+
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+
+            assert!(app.sidebar_visible);
+            assert!(app.ui_layout(app.viewport).navigation.is_some());
+        }
     }
 
     #[test]
     fn scan_invalidates_in_flight_render_results() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.render_generation = 7;
         app.apply_result(WorkResult::Scan(Box::new(super::ScanResult {
             generation: 1,
-            baseline: None,
-            capturing: false,
             files: Vec::new(),
-            changes: Vec::new(),
             notices: Vec::new(),
             error: None,
         })));
 
         assert_eq!(app.render_generation, 8);
-        app.apply_result(WorkResult::Diff {
-            generation: 7,
-            index: 0,
-            lines: Vec::new(),
-        });
-        assert!(app.diff_cache.get(&0).is_none());
     }
 
     #[test]
     fn refresh_invalidates_render_results_before_the_scan_finishes() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.render_generation = 7;
         let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
@@ -2825,17 +2984,12 @@ mod tests {
 
         assert_eq!(app.render_generation, 8);
         assert!(app.loading);
-        app.apply_result(WorkResult::Diff {
-            generation: 7,
-            index: 0,
-            lines: Vec::new(),
-        });
-        assert!(app.diff_cache.get(&0).is_none());
+        assert!(app.git_diff_cache.get(&0).is_none());
     }
 
     #[test]
     fn refresh_does_not_queue_a_second_scan_while_one_is_in_flight() {
-        let mut app = App::new(None, true, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         let (tasks, queued) = std::sync::mpsc::sync_channel(8);
         let newest = std::sync::atomic::AtomicU64::new(1);
 
@@ -2848,25 +3002,28 @@ mod tests {
 
     #[test]
     fn narrow_layout_switches_between_navigation_and_content() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         let navigation = render(&mut app, 42, 12);
         assert!(navigation.contains("Changes"));
         app.focus = Focus::Content;
         let content = render(&mut app, 42, 12);
-        assert!(content.contains("No baseline exists."));
+        assert!(content.contains("Reading Git diff"));
     }
 
     #[test]
     fn changes_navigation_groups_files_and_keeps_file_clicks_mapped() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
-        app.changes = vec![
-            change("src/core/types.ts", ChangeKind::Modified),
-            change("src/core/config.ts", ChangeKind::Added),
-            change("src/ui/App.tsx", ChangeKind::Modified),
+        app.git_changes = vec![
+            git_change("src/core/types.ts", ChangeKind::Modified),
+            git_change("src/core/config.ts", ChangeKind::Added),
+            git_change("src/ui/App.tsx", ChangeKind::Modified),
         ];
-        app.diff_cache.insert(
+        app.git_changes[0].state = GitFileState::Staged;
+        app.git_changes[1].state = GitFileState::Untracked;
+        app.git_changes[2].state = GitFileState::StagedAndUnstaged;
+        app.git_diff_cache.insert(
             0,
             vec![DiffLine {
                 kind: DiffLineKind::Addition,
@@ -2880,42 +3037,60 @@ mod tests {
 
         let rows = app.navigation_rows();
         assert!(
-            matches!(rows[0], super::NavigationRow::Group { ref label, .. } if label == "src/core/")
+            matches!(rows[0], super::NavigationRow::Group { ref label, .. } if label == "staged/")
         );
         assert!(matches!(
             rows[1],
-            super::NavigationRow::File { index: 0, .. }
+            super::NavigationRow::Group { ref label, .. } if label == "src/core/"
         ));
         assert!(matches!(
             rows[2],
-            super::NavigationRow::File { index: 1, .. }
+            super::NavigationRow::File { index: 0, .. }
         ));
         assert!(
-            matches!(rows[3], super::NavigationRow::Group { ref label, .. } if label == "src/ui/")
+            matches!(rows[3], super::NavigationRow::Group { ref label, .. } if label == "mixed/")
         );
         assert!(matches!(
             rows[4],
+            super::NavigationRow::Group { ref label, .. } if label == "src/ui/"
+        ));
+        assert!(matches!(
+            rows[5],
             super::NavigationRow::File { index: 2, .. }
+        ));
+        assert!(matches!(
+            rows[6],
+            super::NavigationRow::Group { ref label, .. } if label == "untracked/"
+        ));
+        assert!(matches!(
+            rows[7],
+            super::NavigationRow::Group { ref label, .. } if label == "src/core/"
+        ));
+        assert!(matches!(
+            rows[8],
+            super::NavigationRow::File { index: 1, .. }
         ));
 
         let layout = app.ui_layout(app.viewport);
         let navigation = layout.navigation.expect("wide layout has navigation");
         assert!(matches!(
             app.navigation_row_at(navigation, navigation.x + 2, navigation.y + 3),
-            Some(super::NavigationRow::File { index: 1, .. })
+            Some(super::NavigationRow::File { index: 0, .. })
         ));
         let output = render(&mut app, 100, 20);
         assert!(output.contains("src/core/"));
         assert!(output.contains("+1 -0"));
+        assert!(output.contains("staged/"));
+        assert!(output.contains("mixed/"));
+        assert!(output.contains("untracked/"));
     }
 
     #[test]
     fn files_navigation_uses_the_same_grouped_tree_style() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.files = vec![file("src/app.rs"), file("src/lib.rs"), file("README.md")];
-        app.diff_cache.insert(0, Vec::new(), 0);
 
         let rows = app.navigation_rows();
         assert!(
@@ -2942,8 +3117,36 @@ mod tests {
     }
 
     #[test]
+    fn files_navigation_renders_language_badges_before_names() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![
+            file("app.tsx"),
+            file("lib.rs"),
+            file("config.json"),
+            file("README.md"),
+        ];
+
+        let output = render(&mut app, 100, 20);
+        assert!(output.contains("⚛  app.tsx"));
+        assert!(output.contains("RS lib.rs"));
+        assert!(output.contains("{} config.json"));
+        assert!(output.contains("MD README.md"));
+    }
+
+    #[test]
+    fn file_icons_fit_the_fixed_badge_slot() {
+        use std::path::Path;
+
+        for path in ["main.rs", "app.ts", "view.tsx", "data.json", "notes.md"] {
+            assert!(file_icon(Path::new(path)).glyph.width() <= 2);
+        }
+    }
+
+    #[test]
     fn clicking_a_folder_collapses_and_reopens_its_files() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.files = vec![file("README.md"), file("src/app.rs"), file("src/lib.rs")];
@@ -2981,7 +3184,7 @@ mod tests {
 
     #[test]
     fn each_tab_preserves_filter_selection_and_scroll() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.changes_state.filter = "src".into();
         app.changes_state.selected = 3;
         app.changes_state.scroll_y = 9;
@@ -3000,8 +3203,23 @@ mod tests {
     }
 
     #[test]
+    fn files_filter_matches_preindexed_filenames_case_insensitively() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("src/Überblick.rs"), file("docs/README.md")];
+        app.file_search_index = FileSearchIndex::from_files(&app.files);
+
+        app.files_state.filter = "ÜBER".into();
+        assert_eq!(app.filtered_file_indices(), vec![0]);
+
+        app.files_state.filter = "readme".into();
+        assert_eq!(app.filtered_file_indices(), vec![1]);
+    }
+
+    #[test]
     fn mouse_click_switches_tabs_and_selects_list_items() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.viewport = Rect::new(0, 0, 80, 18);
         app.files = (0..30)
@@ -3035,7 +3253,7 @@ mod tests {
 
     #[test]
     fn file_list_scrolls_without_changing_the_selected_file() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.files = (0..30)
             .map(|index| file(&format!("file{index}.rs")))
@@ -3053,7 +3271,7 @@ mod tests {
 
     #[test]
     fn read_only_source_shows_a_vertical_scrollbar_when_needed() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.files = vec![file("main.rs")];
@@ -3078,7 +3296,7 @@ mod tests {
 
     #[test]
     fn selected_read_only_source_text_excludes_line_numbers() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.files = vec![file("main.rs")];
@@ -3122,7 +3340,7 @@ mod tests {
 
     #[test]
     fn dragging_past_source_text_clamps_to_the_line_end() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.files = vec![file("main.rs")];
@@ -3155,7 +3373,7 @@ mod tests {
 
     #[test]
     fn mouse_click_places_editor_cursor_and_wheel_scrolls_content() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.tab = Tab::Files;
         app.focus = Focus::Content;
@@ -3249,11 +3467,11 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn diff_scrollbars_drag_both_axes() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.focus = Focus::Content;
         app.viewport = Rect::new(0, 0, 100, 20);
-        app.changes = vec![change("src/main.rs", ChangeKind::Modified)];
+        app.git_changes = vec![git_change("src/main.rs", ChangeKind::Modified)];
         let mut lines = (0..80)
             .map(|line| DiffLine {
                 kind: DiffLineKind::Context,
@@ -3268,7 +3486,7 @@ mod tests {
             old_line: None,
             new_line: Some(81),
         });
-        app.diff_cache.insert(0, lines, 10_000);
+        app.git_diff_cache.insert(0, lines, 10_000);
 
         let (tasks, _) = std::sync::mpsc::sync_channel(8);
         let newest = std::sync::atomic::AtomicU64::new(1);
@@ -3357,7 +3575,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn source_scrollbars_drag_both_axes() {
-        let mut app = App::new(None, false, "w1:p1".into());
+        let mut app = App::new("w1:p1".into());
         app.loading = false;
         app.focus = Focus::Content;
         app.tab = Tab::Files;
@@ -3498,6 +3716,20 @@ mod tests {
                 .iter()
                 .any(|span| span.foreground == ratatui::style::Color::White)
         );
+    }
+
+    #[test]
+    fn javascript_family_extensions_use_javascript_syntax() {
+        let syntaxes = syntect::parsing::SyntaxSet::load_defaults_newlines();
+
+        for extension in ["jsx", "tsx", "ts"] {
+            let syntax = syntax_for_file(
+                Path::new("/tmp/project"),
+                Path::new(&format!("component.{extension}")),
+                &syntaxes,
+            );
+            assert_eq!(syntax.name, "JavaScript", "*.{extension}");
+        }
     }
 
     #[test]

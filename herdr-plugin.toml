@@ -1,16 +1,12 @@
 id = "herdr-agent-diff"
 name = "Herdr Agent Diff"
 version = "0.1.0"
-description = "Read-only filesystem changes and source viewer for detected agent sessions."
+description = "Read-only Git changes and source viewer for Herdr panes."
 min_herdr_version = "0.7.5"
 platforms = ["macos"]
 
 [[build]]
 command = ["cargo", "build", "--release", "--target", "aarch64-apple-darwin"]
-
-[[events]]
-on = "pane.agent_detected"
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "event"]
 
 [[events]]
 on = "pane.closed"
@@ -22,20 +18,20 @@ command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "event"]
 
 [[actions]]
 id = "open"
-title = "Open agent filesystem changes"
-description = "Open or focus this pane's read-only filesystem changes viewer."
+title = "Open Git changes"
+description = "Open or focus this pane's read-only Git changes viewer."
 contexts = ["pane"]
 command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "open"]
 
 [[actions]]
 id = "open-tab"
-title = "Open agent filesystem changes (tab)"
-description = "Open or focus this pane's read-only filesystem changes viewer in its own Herdr tab."
+title = "Open Git changes (tab)"
+description = "Open or focus this pane's read-only Git changes viewer in its own Herdr tab."
 contexts = ["pane"]
 command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "open-tab"]
 
 [[panes]]
 id = "viewer"
-title = "Agent Changes"
+title = "Git Changes"
 placement = "split"
 command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "view"]
