@@ -273,6 +273,11 @@ struct ScanResult {
 
 enum WorkResult {
     Scan(Box<ScanResult>),
+    SourcePreview {
+        generation: u64,
+        index: usize,
+        lines: Vec<Vec<ColoredSpan>>,
+    },
     Highlight {
         generation: u64,
         index: usize,
@@ -578,6 +583,14 @@ impl App {
                 self.scan_error = error;
                 self.notices = notices;
                 self.loading = false;
+            }
+            WorkResult::SourcePreview {
+                generation,
+                index,
+                lines,
+            } if generation == self.render_generation => {
+                let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
+                self.source_cache.insert(index, lines, bytes);
             }
             WorkResult::Highlight {
                 generation,
@@ -2043,10 +2056,7 @@ impl App {
             return;
         }
         let Some(lines) = self.source_cache.get(&selected) else {
-            frame.render_widget(
-                Paragraph::new("Highlighting source…").style(panel_style()),
-                area,
-            );
+            frame.render_widget(Paragraph::new("").style(panel_style()), area);
             return;
         };
         let width = lines.len().max(1).ilog10() as usize + 1;
@@ -2156,9 +2166,9 @@ fn spawn_worker(
     results: mpsc::Sender<WorkResult>,
 ) {
     thread::spawn(move || {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let syntaxes = Arc::new(SyntaxSet::load_defaults_newlines());
         let themes = ThemeSet::load_defaults();
-        let theme = &themes.themes["base16-ocean.dark"];
+        let theme = Arc::new(themes.themes["base16-ocean.dark"].clone());
         while let Ok(task) = tasks.recv() {
             match task {
                 Task::Scan(generation) => {
@@ -2189,26 +2199,59 @@ fn spawn_worker(
                     index,
                     file,
                 } => {
-                    let (lines, notice) = highlight_file(&root, &file, &syntaxes, theme);
-                    let _ = results.send(WorkResult::Highlight {
-                        generation,
-                        index,
-                        lines,
-                        notice,
+                    let root = root.clone();
+                    let results = results.clone();
+                    let syntaxes = Arc::clone(&syntaxes);
+                    let theme = Arc::clone(&theme);
+                    thread::spawn(move || {
+                        let (lines, notice) = match read_source(&root, &file) {
+                            Ok(text) => {
+                                let _ = results.send(WorkResult::SourcePreview {
+                                    generation,
+                                    index,
+                                    lines: plain_source(&text),
+                                });
+                                (
+                                    highlight_source(
+                                        &root,
+                                        &file.relative,
+                                        &text,
+                                        &syntaxes,
+                                        &theme,
+                                    ),
+                                    None,
+                                )
+                            }
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        let _ = results.send(WorkResult::Highlight {
+                            generation,
+                            index,
+                            lines,
+                            notice,
+                        });
                     });
                 }
                 Task::GitScan {
                     generation,
                     comparison,
                 } => {
-                    let _ = results.send(git_scan_result(&root, generation, comparison));
+                    let root = root.clone();
+                    let results = results.clone();
+                    thread::spawn(move || {
+                        let _ = results.send(git_scan_result(&root, generation, comparison));
+                    });
                 }
                 Task::GitDiff {
                     generation,
                     index,
                     change,
                 } => {
-                    let _ = results.send(git_diff_result(&root, generation, index, &change));
+                    let root = root.clone();
+                    let results = results.clone();
+                    thread::spawn(move || {
+                        let _ = results.send(git_diff_result(&root, generation, index, &change));
+                    });
                 }
             }
         }
@@ -2259,34 +2302,61 @@ fn git_diff_result(root: &Path, generation: u64, index: usize, change: &GitChang
     }
 }
 
+#[cfg(test)]
 fn highlight_file(
     root: &Path,
     file: &CurrentFile,
     syntaxes: &SyntaxSet,
     theme: &syntect::highlighting::Theme,
 ) -> (Vec<Vec<ColoredSpan>>, Option<String>) {
+    let text = match read_source(root, file) {
+        Ok(text) => text,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    (
+        highlight_source(root, &file.relative, &text, syntaxes, theme),
+        None,
+    )
+}
+
+fn read_source(root: &Path, file: &CurrentFile) -> std::result::Result<String, String> {
     if file.text != TextEligibility::Text {
-        return (
-            Vec::new(),
-            Some(format!(
-                "{}\n\nMetadata-only file: {:?}, {} bytes",
-                file.relative.display(),
-                file.text,
-                file.size
-            )),
-        );
+        return Err(format!(
+            "{}\n\nMetadata-only file: {:?}, {} bytes",
+            file.relative.display(),
+            file.text,
+            file.size
+        ));
     }
     let bytes = match safe_read(root, &file.relative, crate::model::INLINE_TEXT_LIMIT) {
         Ok(bytes) => bytes,
-        Err(error) => return (Vec::new(), Some(error.to_string())),
+        Err(error) => return Err(error.to_string()),
     };
-    let Ok(text) = String::from_utf8(bytes) else {
-        return (Vec::new(), Some("file is not valid UTF-8".into()));
-    };
-    let syntax = syntax_for_file(root, &file.relative, syntaxes);
+    String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".into())
+}
+
+fn plain_source(text: &str) -> Vec<Vec<ColoredSpan>> {
+    LinesWithEndings::from(text)
+        .map(|line| {
+            vec![ColoredSpan {
+                text: line.trim_end_matches(['\r', '\n']).to_owned(),
+                foreground: Color::White,
+            }]
+        })
+        .collect()
+}
+
+fn highlight_source(
+    root: &Path,
+    relative: &Path,
+    text: &str,
+    syntaxes: &SyntaxSet,
+    theme: &syntect::highlighting::Theme,
+) -> Vec<Vec<ColoredSpan>> {
+    let syntax = syntax_for_file(root, relative, syntaxes);
     let default_foreground = theme.settings.foreground;
     let mut highlighter = HighlightLines::new(syntax, theme);
-    let lines = LinesWithEndings::from(&text)
+    LinesWithEndings::from(text)
         .map(|line| {
             highlighter
                 .highlight_line(line, syntaxes)
@@ -2302,8 +2372,7 @@ fn highlight_file(
                 })
                 .collect()
         })
-        .collect();
-    (lines, None)
+        .collect()
 }
 
 fn syntax_for_file<'a>(
@@ -3108,6 +3177,40 @@ mod tests {
         app.focus = Focus::Content;
         let content = render(&mut app, 42, 12);
         assert!(content.contains("Reading Git diff"));
+    }
+
+    #[test]
+    fn source_preview_renders_before_highlighting_finishes() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("main.rs")];
+        app.render_generation = 3;
+        app.apply_result(WorkResult::SourcePreview {
+            generation: 3,
+            index: 0,
+            lines: vec![vec![super::ColoredSpan {
+                text: "fn main() {}".into(),
+                foreground: Color::White,
+            }]],
+        });
+
+        let output = render(&mut app, 80, 18);
+
+        assert!(output.contains("fn main() {}"));
+        assert!(!output.contains("Highlighting source"));
+    }
+
+    #[test]
+    fn pending_source_does_not_show_a_placeholder() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("main.rs")];
+
+        let output = render(&mut app, 80, 18);
+
+        assert!(!output.contains("Highlighting source"));
     }
 
     #[test]
