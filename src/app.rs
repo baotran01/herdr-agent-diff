@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -9,7 +10,8 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -379,6 +381,7 @@ impl TerminalSession {
             EnterAlternateScreen,
             EnableFocusChange,
             EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             SetCursorStyle::SteadyBar,
         ) {
             let _ = disable_raw_mode();
@@ -386,6 +389,7 @@ impl TerminalSession {
                 io::stdout(),
                 DisableMouseCapture,
                 DisableFocusChange,
+                PopKeyboardEnhancementFlags,
                 SetCursorStyle::DefaultUserShape,
                 LeaveAlternateScreen
             );
@@ -399,6 +403,7 @@ impl TerminalSession {
                     io::stdout(),
                     DisableMouseCapture,
                     DisableFocusChange,
+                    PopKeyboardEnhancementFlags,
                     SetCursorStyle::DefaultUserShape,
                     LeaveAlternateScreen
                 );
@@ -421,6 +426,7 @@ impl Drop for TerminalSession {
             self.terminal.backend_mut(),
             DisableMouseCapture,
             DisableFocusChange,
+            PopKeyboardEnhancementFlags,
             SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen
         );
@@ -720,6 +726,16 @@ impl App {
             return false;
         }
         match key.code {
+            KeyCode::Char(character)
+                if character.eq_ignore_ascii_case(&'c')
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::SUPER | KeyModifiers::META) =>
+            {
+                if self.tab == Tab::Files && self.focus == Focus::Content {
+                    self.copy_selection();
+                }
+            }
             KeyCode::Char('q') => return true,
             KeyCode::Char('?') => {
                 self.mode = if self.mode == Mode::Help {
@@ -892,13 +908,13 @@ impl App {
         let visual_column =
             usize::from(x.saturating_sub(content_area.x)).saturating_add(self.files_state.scroll_x);
         let code_end = code_start.saturating_add(source_text_width(spans));
-        if visual_column < code_start || visual_column >= code_end {
+        if visual_column < code_start {
             return None;
         }
         Some(EditorCursor {
             tab: self.tab,
             line,
-            column: visual_column,
+            column: visual_column.min(code_end),
         })
     }
 
@@ -964,11 +980,71 @@ impl App {
         }
         let start_column = if line == start.line { start.column } else { 0 };
         let end_column = if line == end.line {
-            end.column
+            end.column.saturating_add(self.selection_cursor_width(end))
         } else {
             usize::MAX
         };
         (start_column < end_column).then_some((start_column, end_column))
+    }
+
+    fn selection_cursor_width(&self, cursor: EditorCursor) -> usize {
+        let Some(selected) = self.actual_selected() else {
+            return 1;
+        };
+        let Some(lines) = self.source_cache.get(&selected) else {
+            return 1;
+        };
+        let line_number_width = decimal_width(lines.len());
+        let code_start = line_number_width.saturating_add(3);
+        let column = cursor.column.saturating_sub(code_start);
+        lines
+            .get(cursor.line)
+            .and_then(|spans| source_char_width_at(spans, column))
+            .unwrap_or(1)
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_source_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        if let Err(error) = copy_to_clipboard(&text) {
+            self.notices.push(format!("clipboard copy failed: {error}"));
+        }
+    }
+
+    fn selected_source_text(&self) -> Option<String> {
+        if self.tab != Tab::Files {
+            return None;
+        }
+        let selected = self.actual_selected()?;
+        let lines = self.source_cache.get(&selected)?;
+        let (start, end) = self.selection_bounds()?;
+        let line_number_width = decimal_width(lines.len());
+        let code_start = line_number_width.saturating_add(3);
+        let mut text = String::new();
+        for line in start.line..=end.line {
+            if line > start.line {
+                text.push('\n');
+            }
+            let spans = lines.get(line)?;
+            let line_start = if line == start.line {
+                start.column.saturating_sub(code_start)
+            } else {
+                0
+            };
+            let line_end = if line == end.line {
+                end.column
+                    .saturating_add(self.selection_cursor_width(end))
+                    .saturating_sub(code_start)
+            } else {
+                usize::MAX
+            };
+            text.push_str(&source_text_range(spans, line_start, line_end));
+        }
+        Some(text)
     }
 
     fn navigation_row_at(&self, area: Rect, column: u16, row: u16) -> Option<NavigationRow> {
@@ -1164,6 +1240,9 @@ impl App {
                     self.begin_selection_at(area, mouse.column, mouse.row);
                 } else {
                     self.extend_selection_at(area, mouse.column, mouse.row);
+                    if left_release {
+                        self.copy_selection();
+                    }
                 }
                 self.request_selected(tasks);
                 return;
@@ -1911,6 +1990,7 @@ impl App {
                  ←→ or hl    horizontal scroll\n\
                  /           filter active list\n\
                  r           full refresh\n\
+                 ⌘C          copy selected text; mouse selections copy on release\n\
                  ?           close help\n\
                  q           close viewer\n\n\
                  Read only. Git mode uses read-only Git commands.\n\
@@ -2156,6 +2236,22 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("pbcopy stdin is unavailable"))?;
+    stdin.write_all(text.as_bytes())?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("pbcopy exited unsuccessfully"))
+    }
+}
+
 fn panel_style() -> Style {
     Style::default().fg(PANEL_FOREGROUND).bg(PANEL_BACKGROUND)
 }
@@ -2202,6 +2298,33 @@ fn source_text_width(spans: &[ColoredSpan]) -> usize {
         .flat_map(|span| span.text.chars())
         .map(|character| character.width().unwrap_or(0))
         .sum()
+}
+
+fn source_text_range(spans: &[ColoredSpan], start: usize, end: usize) -> String {
+    let mut output = String::new();
+    let mut column: usize = 0;
+    for character in spans.iter().flat_map(|span| span.text.chars()) {
+        let width = character.width().unwrap_or(0);
+        let occupied_end = column.saturating_add(width.max(1));
+        if column < end && occupied_end > start {
+            output.push(character);
+        }
+        column = column.saturating_add(width);
+    }
+    output
+}
+
+fn source_char_width_at(spans: &[ColoredSpan], target: usize) -> Option<usize> {
+    let mut column: usize = 0;
+    for character in spans.iter().flat_map(|span| span.text.chars()) {
+        let width = character.width().unwrap_or(0);
+        let occupied_end = column.saturating_add(width.max(1));
+        if target >= column && target < occupied_end {
+            return Some(width.max(1));
+        }
+        column = column.saturating_add(width);
+    }
+    None
 }
 
 fn styled_source_segment(text: String, foreground: Color, selected: bool) -> Span<'static> {
@@ -2951,6 +3074,83 @@ mod tests {
 
         assert!(output.contains('▲'));
         assert!(output.contains('▼'));
+    }
+
+    #[test]
+    fn selected_read_only_source_text_excludes_line_numbers() {
+        let mut app = App::new(None, false, "w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("main.rs")];
+        app.source_cache.insert(
+            0,
+            vec![
+                vec![super::ColoredSpan {
+                    text: "fn main() {".into(),
+                    foreground: Color::White,
+                }],
+                vec![super::ColoredSpan {
+                    text: "    println!(\"hi\");".into(),
+                    foreground: Color::White,
+                }],
+                vec![super::ColoredSpan {
+                    text: "}".into(),
+                    foreground: Color::White,
+                }],
+            ],
+            32,
+        );
+        app.selection = Some(super::EditorSelection {
+            tab: Tab::Files,
+            anchor: super::EditorCursor {
+                tab: Tab::Files,
+                line: 0,
+                column: 7,
+            },
+            active: super::EditorCursor {
+                tab: Tab::Files,
+                line: 2,
+                column: 5,
+            },
+        });
+
+        assert_eq!(
+            app.selected_source_text().as_deref(),
+            Some("main() {\n    println!(\"hi\");\n}")
+        );
+    }
+
+    #[test]
+    fn dragging_past_source_text_clamps_to_the_line_end() {
+        let mut app = App::new(None, false, "w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("main.rs")];
+        app.source_cache.insert(
+            0,
+            vec![vec![super::ColoredSpan {
+                text: "abc".into(),
+                foreground: Color::White,
+            }]],
+            3,
+        );
+        app.viewport = Rect::new(0, 0, 80, 18);
+        let content = app.ui_layout(app.viewport).content.expect("content pane");
+        let inner = super::bordered_inner(content);
+        let [source_area, _] = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Min(1),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .areas(inner);
+
+        assert_eq!(
+            app.cursor_at_text(content, source_area.x.saturating_add(20), source_area.y,),
+            Some(super::EditorCursor {
+                tab: Tab::Files,
+                line: 0,
+                column: 7,
+            })
+        );
     }
 
     #[test]

@@ -104,6 +104,7 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `Enter` | Open a selected file or toggle a selected folder. |
 | `/` | Filter the sidebar. |
 | `r` | Refresh the current comparison or file view. |
+| `⌘C` | Copy the selected text from the read-only Files pane. Mouse selections are also copied on release. |
 | `?` | Show the help overlay. |
 | `q` or `Esc` | Close the viewer or dismiss an overlay. |
 
