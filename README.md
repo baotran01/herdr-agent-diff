@@ -191,6 +191,14 @@ cargo build --release --target aarch64-apple-darwin
 
 The test suite covers working-tree Git changes, unpushed commits, workspace scanning, safe reads, viewer mappings, folder navigation/collapse, diff rendering, and terminal UI behavior.
 
+GitHub Actions runs formatting, Clippy, tests, and a macOS arm64 release build for pushes to `main` and pull requests targeting `main`. Pushing a version tag publishes a GitHub Release with a macOS arm64 archive and SHA-256 checksum:
+
+```sh
+# Use a tag matching the version in Cargo.toml and herdr-plugin.toml.
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Troubleshooting
 
 ### The Git diff view is empty

@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish macOS arm64 release
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-apple-darwin-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-aarch64-apple-darwin-cargo-
+
+      - name: Install release target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --locked --release --target aarch64-apple-darwin
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package_name="herdr-agent-diff-${VERSION}-aarch64-apple-darwin"
+          package_dir="dist/${package_name}"
+
+          mkdir -p "$package_dir"
+          cp target/aarch64-apple-darwin/release/herdr-agent-diff "$package_dir/"
+          cp Cargo.toml Cargo.lock rust-toolchain.toml herdr-plugin.toml README.md LICENSE "$package_dir/"
+          cp -R src "$package_dir/"
+
+          tar -C dist -czf "dist/${package_name}.tar.gz" "$package_name"
+          shasum -a 256 "dist/${package_name}.tar.gz" > "dist/${package_name}.tar.gz.sha256"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz \
+            dist/*.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "Herdr Agent Diff $GITHUB_REF_NAME"
