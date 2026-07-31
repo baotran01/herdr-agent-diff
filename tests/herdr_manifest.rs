@@ -37,10 +37,19 @@ fn context() -> PluginContext {
 }
 
 #[test]
-fn manifest_declares_documented_075_events_action_and_split_pane() {
+fn manifest_declares_documented_070_build_events_action_and_split_pane() {
     let raw = fs::read_to_string("herdr-plugin.toml").expect("manifest");
     let manifest: toml::Value = toml::from_str(&raw).expect("valid TOML");
-    assert_eq!(manifest["min_herdr_version"].as_str(), Some("0.7.5"));
+    assert_eq!(manifest["min_herdr_version"].as_str(), Some("0.7.0"));
+    assert_eq!(
+        manifest["build"][0]["command"]
+            .as_array()
+            .expect("build command"),
+        &[
+            toml::Value::String("/bin/sh".into()),
+            toml::Value::String("scripts/install.sh".into()),
+        ]
+    );
     assert_eq!(
         manifest["platforms"].as_array().expect("platforms")[0].as_str(),
         Some("macos")

@@ -39,16 +39,23 @@ Press `g` to switch between the two Changes views. This makes it easy to see bot
 ## Requirements
 
 - macOS on Apple silicon (`aarch64-apple-darwin`).
-- Rust and Cargo.
-- Herdr 0.7.5 or newer.
+- Herdr 0.7.0 or newer.
 - Git.
 - A tracked remote branch (`@{upstream}`) to use Unpushed commits mode.
 
-The plugin is currently packaged for macOS arm64 because its manifest declares that target and its release command builds for `aarch64-apple-darwin`.
+Marketplace installation does not require Rust or Cargo when the matching GitHub Release is available. The installer downloads the macOS arm64 binary and verifies its SHA-256 checksum. Rust and Cargo are only needed for a local source build or as a fallback before a release is published.
 
 ## Build and install
 
-Build the release binary:
+Install from the Herdr Marketplace:
+
+```sh
+herdr plugin install baotran01/herdr-agent-diff
+```
+
+Herdr runs `scripts/install.sh` during installation. It downloads the release matching the plugin version, verifies the checksum, and places the binary in the plugin build directory. If that release is unavailable, the script uses Cargo when it is already installed; it does not install Rust or modify the user's toolchain.
+
+For a local source build, build the release binary:
 
 ```sh
 cargo build --release --target aarch64-apple-darwin
@@ -195,8 +202,8 @@ GitHub Actions runs formatting, Clippy, tests, and a macOS arm64 release build f
 
 ```sh
 # Use a tag matching the version in Cargo.toml and herdr-plugin.toml.
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## Troubleshooting

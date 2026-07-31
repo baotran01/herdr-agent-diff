@@ -1,12 +1,12 @@
 id = "herdr-agent-diff"
 name = "Herdr Agent Diff"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read-only Git changes and source viewer for Herdr panes."
-min_herdr_version = "0.7.5"
+min_herdr_version = "0.7.0"
 platforms = ["macos"]
 
 [[build]]
-command = ["cargo", "build", "--release", "--target", "aarch64-apple-darwin"]
+command = ["/bin/sh", "scripts/install.sh"]
 
 [[events]]
 on = "pane.closed"
