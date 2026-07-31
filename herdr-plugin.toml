@@ -1,37 +1,37 @@
 id = "herdr-agent-diff"
 name = "Herdr Agent Diff"
-version = "0.1.1"
+version = "0.1.2"
 description = "Read-only Git changes and source viewer for Herdr panes."
 min_herdr_version = "0.7.0"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 [[build]]
 command = ["/bin/sh", "scripts/install.sh"]
 
 [[events]]
 on = "pane.closed"
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "event"]
+command = ["/bin/sh", "scripts/run.sh", "event"]
 
 [[events]]
 on = "pane.exited"
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "event"]
+command = ["/bin/sh", "scripts/run.sh", "event"]
 
 [[actions]]
 id = "open"
 title = "Open Git changes"
 description = "Open or focus this pane's read-only Git changes viewer."
 contexts = ["pane"]
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "open"]
+command = ["/bin/sh", "scripts/run.sh", "open"]
 
 [[actions]]
 id = "open-tab"
 title = "Open Git changes (tab)"
 description = "Open or focus this pane's read-only Git changes viewer in its own Herdr tab."
 contexts = ["pane"]
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "open-tab"]
+command = ["/bin/sh", "scripts/run.sh", "open-tab"]
 
 [[panes]]
 id = "viewer"
 title = "Git Changes"
 placement = "split"
-command = ["./target/aarch64-apple-darwin/release/herdr-agent-diff", "view"]
+command = ["/bin/sh", "scripts/run.sh", "view"]

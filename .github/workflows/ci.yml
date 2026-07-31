@@ -74,3 +74,32 @@ jobs:
           path: target/aarch64-apple-darwin/release/herdr-agent-diff
           if-no-files-found: error
           retention-days: 7
+
+  linux:
+    name: Build Linux x86_64 release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-unknown-linux-gnu-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-x86_64-unknown-linux-gnu-cargo-
+
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdr-agent-diff-linux-x86_64-${{ github.sha }}
+          path: target/x86_64-unknown-linux-gnu/release/herdr-agent-diff
+          if-no-files-found: error
+          retention-days: 7

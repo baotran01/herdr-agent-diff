@@ -1,6 +1,6 @@
 # Herdr Agent Diff
 
-Herdr Agent Diff is a macOS arm64 plugin for [Herdr](https://herdr.dev/) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
+Herdr Agent Diff is a native macOS and Linux plugin for [Herdr](https://herdr.dev/) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
 
 The viewer has two tabs:
 
@@ -34,16 +34,18 @@ Press `g` to switch between the two Changes views. This makes it easy to see bot
 - **File watching:** [`notify`](https://github.com/notify-rs/notify) for detecting workspace changes while the viewer is open.
 - **Diff parsing and syntax highlighting:** a bounded unified diff parser and [`syntect`](https://github.com/trishume/syntect) for syntax highlighting.
 - **Workspace scanning:** [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) for ignore-file-aware traversal, with platform filesystem support through [`rustix`](https://github.com/bytecodealliance/rustix) on Unix.
-- **Integration:** A native macOS arm64 Herdr plugin using read-only Git subprocesses.
+- **Integration:** Native macOS arm64 and Linux x86_64 Herdr builds using read-only Git subprocesses.
 
 ## Requirements
 
-- macOS on Apple silicon (`aarch64-apple-darwin`).
+- macOS on Apple silicon (`aarch64-apple-darwin`) or Linux x86_64 (`x86_64-unknown-linux-gnu`). Linux arm64 (`aarch64-unknown-linux-gnu`) is also supported when built locally.
 - Herdr 0.7.0 or newer.
 - Git.
 - A tracked remote branch (`@{upstream}`) to use Unpushed commits mode.
 
-Marketplace installation does not require Rust or Cargo when the matching GitHub Release is available. The installer downloads the macOS arm64 binary and verifies its SHA-256 checksum. Rust and Cargo are only needed for a local source build or as a fallback before a release is published.
+Linux clipboard copying uses `wl-copy`, `xclip`, or `xsel` when available, and falls back to the terminal's OSC 52 clipboard protocol.
+
+Marketplace installation does not require Rust or Cargo when the matching GitHub Release is available. The installer downloads the host-specific binary and verifies its SHA-256 checksum. Rust and Cargo are only needed for a local source build or as a fallback before a release is published.
 
 ## Build and install
 
@@ -53,11 +55,37 @@ Install from the Herdr Marketplace:
 herdr plugin install baotran01/herdr-agent-diff
 ```
 
-Herdr runs `scripts/install.sh` during installation. It downloads the release matching the plugin version, verifies the checksum, and places the binary in the plugin build directory. If that release is unavailable, the script uses Cargo when it is already installed; it does not install Rust or modify the user's toolchain.
+Herdr runs `scripts/install.sh` during installation. It detects the host target, downloads the matching release, verifies the checksum, and places the binary in the plugin build directory. If that release is unavailable, the script uses Cargo when it is already installed; it does not install Rust or modify the user's toolchain.
+
+### Updating an installed plugin
+
+For a GitHub-managed installation, reinstall the plugin to fetch the latest version and rerun the build step:
+
+```sh
+herdr plugin install baotran01/herdr-agent-diff --yes
+```
+
+To install a specific release, use its tag:
+
+```sh
+herdr plugin install baotran01/herdr-agent-diff --ref v0.1.2 --yes
+```
+
+Reinstalling replaces the managed checkout and reruns `scripts/install.sh`. The installer detects macOS or Linux, atomically replaces the binary after a successful download/build, and preserves an existing binary if the update fails. Close any already-open viewer pane and reopen it so Herdr starts the new binary.
+
+For a locally linked checkout, pull the changes and relink it:
+
+```sh
+git pull
+herdr plugin link "$PWD"
+```
 
 For a local source build, build the release binary:
 
 ```sh
+cargo build --release --target x86_64-unknown-linux-gnu
+
+# macOS arm64
 cargo build --release --target aarch64-apple-darwin
 ```
 
@@ -123,7 +151,7 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `Enter` | Open a selected file or toggle a selected folder. |
 | `/` | Filter the sidebar. |
 | `r` | Refresh the current comparison or file view. |
-| `⌘C` | Copy selected text from the read-only Files pane. |
+| `Ctrl+C` on Linux (`⌘C` on macOS) | Copy selected text from the read-only Files pane. |
 | `?` | Show the help overlay. |
 | `q` or `Esc` | Close the viewer or dismiss an overlay. |
 
@@ -193,17 +221,18 @@ Run formatting, linting, tests, and a release build before publishing changes:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo build --release --target x86_64-unknown-linux-gnu
 cargo build --release --target aarch64-apple-darwin
 ```
 
 The test suite covers working-tree Git changes, unpushed commits, workspace scanning, safe reads, viewer mappings, folder navigation/collapse, diff rendering, and terminal UI behavior.
 
-GitHub Actions runs formatting, Clippy, tests, and a macOS arm64 release build for pushes to `main` and pull requests targeting `main`. Pushing a version tag publishes a GitHub Release with a macOS arm64 archive and SHA-256 checksum:
+GitHub Actions runs formatting, Clippy, tests, and macOS arm64/Linux x86_64 release builds for pushes to `main` and pull requests targeting `main`. Pushing a version tag publishes GitHub Release archives and SHA-256 checksums for both targets:
 
 ```sh
 # Use a tag matching the version in Cargo.toml and herdr-plugin.toml.
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 ## Troubleshooting

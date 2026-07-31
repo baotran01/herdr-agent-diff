@@ -798,9 +798,9 @@ impl App {
         match key.code {
             KeyCode::Char(character)
                 if character.eq_ignore_ascii_case(&'c')
-                    && key
-                        .modifiers
-                        .intersects(KeyModifiers::SUPER | KeyModifiers::META) =>
+                    && key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
+                    ) =>
             {
                 if self.tab == Tab::Files && self.focus == Focus::Content {
                     self.copy_selection();
@@ -2145,7 +2145,7 @@ impl App {
                  ←→ or hl    horizontal scroll\n\
                  /           filter active list\n\
                  r           full refresh\n\
-                 ⌘C          copy selected text; mouse selections copy on release\n\
+                 Ctrl+C / ⌘C copy selected text; mouse selections copy on release\n\
                  ?           close help\n\
                  q           close viewer\n\n\
                  Read only. Git diff shows local changes; Unpushed shows commits ahead of @{upstream}.\n\
@@ -2446,20 +2446,113 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
-fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+fn copy_with_command(program: &str, arguments: &[&str], text: &str) -> io::Result<Option<()>> {
+    let mut child = match Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("pbcopy stdin is unavailable"))?;
+        .ok_or_else(|| io::Error::other("clipboard stdin is unavailable"))?;
     stdin.write_all(text.as_bytes())?;
     drop(stdin);
     let status = child.wait()?;
     if status.success() {
-        Ok(())
+        Ok(Some(()))
     } else {
-        Err(io::Error::other("pbcopy exited unsuccessfully"))
+        Err(io::Error::other(format!("{program} exited unsuccessfully")))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    copy_with_command("pbcopy", &[], text)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "pbcopy is unavailable on this macOS system",
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let mut candidates = if wayland {
+        vec![
+            ("wl-copy", Vec::new()),
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+        ]
+    } else {
+        vec![
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+            ("wl-copy", Vec::new()),
+        ]
+    };
+    let mut last_error = None;
+    for (program, arguments) in candidates.drain(..) {
+        match copy_with_command(program, &arguments, text) {
+            Ok(Some(())) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if let Ok(()) = copy_via_osc52(text) {
+        return Ok(());
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no Linux clipboard provider found (install wl-clipboard, xclip, or xsel)",
+        )
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn copy_via_osc52(text: &str) -> io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
+}
+
+#[cfg(target_os = "linux")]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[usize::from(first >> 2)] as char);
+        encoded.push(TABLE[usize::from(((first & 0b11) << 4) | (second >> 4))] as char);
+        encoded.push(if chunk.len() > 1 {
+            TABLE[usize::from(((second & 0b1111) << 2) | (third >> 6))] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            TABLE[usize::from(third & 0b11_1111)] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn copy_to_clipboard(_text: &str) -> io::Result<()> {
+    Err(io::Error::other(
+        "clipboard copying is unsupported on this platform",
+    ))
 }
 
 fn panel_style() -> Style {
@@ -2955,6 +3048,8 @@ mod tests {
     use tempfile::TempDir;
     use unicode_width::UnicodeWidthStr;
 
+    #[cfg(target_os = "linux")]
+    use super::base64_encode;
     use super::{
         App, Cache, ChangesMode, FileSearchIndex, Focus, Tab, Task, WorkResult,
         brighten_code_component, file_icon, highlight_file, saturating_u16, syntax_for_file,
@@ -2996,6 +3091,14 @@ mod tests {
             modified_unix_ns: None,
             text: TextEligibility::Text,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn osc52_clipboard_encoding_matches_base64() {
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
 
     fn git_change(path: &str, kind: ChangeKind) -> GitChange {

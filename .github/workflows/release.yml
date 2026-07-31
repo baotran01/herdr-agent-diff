@@ -12,9 +12,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Build and publish macOS arm64 release
-    runs-on: macos-14
+  build:
+    name: Build ${{ matrix.target }} release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,31 +34,57 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-aarch64-apple-darwin-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-aarch64-apple-darwin-cargo-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Install release target
-        run: rustup target add aarch64-apple-darwin
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: rustup target add ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release --target aarch64-apple-darwin
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package release assets
         env:
           VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          package_name="herdr-agent-diff-${VERSION}-aarch64-apple-darwin"
+          package_name="herdr-agent-diff-${VERSION}-${TARGET}"
           package_dir="dist/${package_name}"
 
           mkdir -p "$package_dir"
-          cp target/aarch64-apple-darwin/release/herdr-agent-diff "$package_dir/"
+          cp "target/${TARGET}/release/herdr-agent-diff" "$package_dir/"
           cp Cargo.toml Cargo.lock rust-toolchain.toml herdr-plugin.toml README.md LICENSE "$package_dir/"
-          cp -R src "$package_dir/"
+          cp -R scripts src "$package_dir/"
 
           tar -C dist -czf "dist/${package_name}.tar.gz" "$package_name"
-          shasum -a 256 "dist/${package_name}.tar.gz" > "dist/${package_name}.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${package_name}.tar.gz" > "dist/${package_name}.tar.gz.sha256"
+          else
+            shasum -a 256 "dist/${package_name}.tar.gz" > "dist/${package_name}.tar.gz.sha256"
+          fi
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub release
         env:

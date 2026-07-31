@@ -50,10 +50,42 @@ fn manifest_declares_documented_070_build_events_action_and_split_pane() {
             toml::Value::String("scripts/install.sh".into()),
         ]
     );
-    assert_eq!(
-        manifest["platforms"].as_array().expect("platforms")[0].as_str(),
-        Some("macos")
-    );
+    let platforms: Vec<_> = manifest["platforms"]
+        .as_array()
+        .expect("platforms")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(platforms, ["macos", "linux"]);
+    for command in manifest["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| &event["command"])
+        .chain(
+            manifest["actions"]
+                .as_array()
+                .expect("actions")
+                .iter()
+                .map(|action| &action["command"]),
+        )
+        .chain(
+            manifest["panes"]
+                .as_array()
+                .expect("panes")
+                .iter()
+                .map(|pane| &pane["command"]),
+        )
+    {
+        let command = command.as_array().expect("command");
+        assert_eq!(command.len(), 3);
+        assert_eq!(command[0].as_str(), Some("/bin/sh"));
+        assert_eq!(command[1].as_str(), Some("scripts/run.sh"));
+        assert!(matches!(
+            command[2].as_str(),
+            Some("event" | "open" | "open-tab" | "view")
+        ));
+    }
     let events = manifest["events"].as_array().expect("events");
     let names: Vec<_> = events
         .iter()

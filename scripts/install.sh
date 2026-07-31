@@ -3,8 +3,27 @@
 set -eu
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-target_triple="aarch64-apple-darwin"
 binary_name="herdr-agent-diff"
+
+detect_target() {
+    case "$(uname -s):$(uname -m)" in
+        Darwin:arm64)
+            printf '%s\n' "aarch64-apple-darwin"
+            ;;
+        Linux:x86_64|Linux:amd64)
+            printf '%s\n' "x86_64-unknown-linux-gnu"
+            ;;
+        Linux:aarch64|Linux:arm64)
+            printf '%s\n' "aarch64-unknown-linux-gnu"
+            ;;
+        *)
+            printf '%s\n' "herdr-agent-diff does not support this OS/architecture: $(uname -s) $(uname -m)." >&2
+            return 1
+            ;;
+    esac
+}
+
+target_triple=$(detect_target)
 binary_path="$root_dir/target/$target_triple/release/$binary_name"
 
 manifest_version=$(awk -F '"' '$1 ~ /^version[[:space:]]*=/ { print $2; exit }' "$root_dir/herdr-plugin.toml")
@@ -14,7 +33,11 @@ archive_name="$package_name.tar.gz"
 release_base_url="https://github.com/baotran01/herdr-agent-diff/releases/download/$release_tag"
 
 temp_dir=
+staged_binary=
 cleanup() {
+    if [ -n "${staged_binary:-}" ]; then
+        rm -f "$staged_binary"
+    fi
     if [ -n "${temp_dir:-}" ]; then
         rm -rf "$temp_dir"
     fi
@@ -23,8 +46,10 @@ trap cleanup EXIT HUP INT TERM
 
 download_release() {
     command -v curl >/dev/null 2>&1 || return 1
-    command -v shasum >/dev/null 2>&1 || return 1
     command -v tar >/dev/null 2>&1 || return 1
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        return 1
+    fi
 
     temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-agent-diff.XXXXXX") || return 1
     archive_path="$temp_dir/$archive_name"
@@ -44,7 +69,11 @@ download_release() {
     fi
 
     expected_hash=$(awk 'NR == 1 { print $1; exit }' "$checksum_path")
-    actual_hash=$(shasum -a 256 "$archive_path" | awk '{ print $1 }')
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_hash=$(sha256sum "$archive_path" | awk '{ print $1 }')
+    else
+        actual_hash=$(shasum -a 256 "$archive_path" | awk '{ print $1 }')
+    fi
     [ -n "$expected_hash" ] && [ "$expected_hash" = "$actual_hash" ] || return 1
 
     mkdir -p "$(dirname "$binary_path")"
@@ -55,8 +84,17 @@ download_release() {
         return 1
     fi
 
-    cp "$temp_dir/$package_name/$binary_name" "$binary_path"
-    chmod 755 "$binary_path"
+    replace_binary "$temp_dir/$package_name/$binary_name" "$binary_path"
+}
+
+replace_binary() {
+    source_path=$1
+    destination_path=$2
+    staged_binary="$destination_path.tmp-$$"
+    cp "$source_path" "$staged_binary"
+    chmod 755 "$staged_binary"
+    mv -f "$staged_binary" "$destination_path"
+    staged_binary=
 }
 
 find_cargo() {
@@ -67,6 +105,8 @@ find_cargo() {
 
     for candidate in \
         "${HOME:-}/.cargo/bin/cargo" \
+        "/usr/local/bin/cargo" \
+        "/usr/bin/cargo" \
         "/opt/homebrew/opt/rustup/bin/cargo" \
         "/usr/local/opt/rustup/bin/cargo" \
         "/opt/homebrew/bin/cargo" \
@@ -79,11 +119,6 @@ find_cargo() {
 
     return 1
 }
-
-if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
-    printf '%s\n' "herdr-agent-diff requires macOS on Apple silicon (aarch64-apple-darwin)." >&2
-    exit 1
-fi
 
 # Marketplace installs use this path, so a Rust toolchain is not required once
 # the matching GitHub release exists. The checksum is verified before copying.
@@ -103,7 +138,8 @@ cat >&2 <<EOF
 Could not install $binary_name.
 
 The prebuilt release $release_tag is unavailable, and Cargo was not found.
-Publish the matching GitHub release or install Rust/Cargo, then retry the Herdr
-plugin install.
+Publish the matching $target_triple release or install Rust/Cargo, then retry
+the Herdr plugin install.
+$(if [ -x "$binary_path" ]; then printf '%s\n' "The existing installed binary was left unchanged."; fi)
 EOF
 exit 1
