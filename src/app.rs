@@ -36,6 +36,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::diff::{DiffLine, DiffLineKind};
 use crate::git::{
     GitChange, GitComparison, GitFileState, diff as render_git_diff, scan as scan_git,
+    unpushed_commit_count,
 };
 use crate::herdr::{Herdr, pane_exists};
 use crate::model::{ChangeKind, CurrentFile, TextEligibility};
@@ -281,6 +282,7 @@ enum WorkResult {
     GitScan {
         generation: u64,
         changes: Vec<GitChange>,
+        unpushed_commits: Option<usize>,
         error: Option<String>,
     },
     GitDiff {
@@ -490,6 +492,7 @@ struct App {
     render_generation: u64,
     requested: BTreeSet<(Tab, usize, u64)>,
     git_diff_cache: Cache<usize, Vec<DiffLine>>,
+    unpushed_commits: Option<usize>,
     source_cache: Cache<usize, Vec<Vec<ColoredSpan>>>,
     source_notices: Cache<usize, String>,
     scan_error: Option<String>,
@@ -523,6 +526,7 @@ impl App {
             render_generation: 0,
             requested: BTreeSet::new(),
             git_diff_cache: Cache::new(),
+            unpushed_commits: None,
             source_cache: Cache::new(),
             source_notices: Cache::new(),
             scan_error: None,
@@ -555,6 +559,7 @@ impl App {
                     self.source_notices.clear();
                     self.git_changes.clear();
                     self.git_diff_cache.clear();
+                    self.unpushed_commits = None;
                     self.git_error = None;
                     self.git_state = GitState::Unloaded;
                     self.clamp_selections();
@@ -580,6 +585,7 @@ impl App {
             WorkResult::GitScan {
                 generation,
                 changes,
+                unpushed_commits,
                 error,
             } if generation == self.render_generation => {
                 self.git_state = GitState::Loaded;
@@ -589,6 +595,7 @@ impl App {
                     self.git_diff_cache.clear();
                     self.clamp_selections();
                 }
+                self.unpushed_commits = unpushed_commits;
                 self.git_error = error;
             }
             WorkResult::GitDiff {
@@ -617,6 +624,7 @@ impl App {
             self.requested.clear();
             self.git_changes.clear();
             self.git_diff_cache.clear();
+            self.unpushed_commits = None;
             self.git_error = None;
             self.git_state = GitState::Unloaded;
             true
@@ -712,6 +720,7 @@ impl App {
         self.requested.clear();
         self.git_changes.clear();
         self.git_diff_cache.clear();
+        self.unpushed_commits = None;
         self.git_error = None;
         self.git_state = GitState::Unloaded;
     }
@@ -1845,7 +1854,7 @@ impl App {
                     format!("Reading {}…", self.changes_mode.label())
                 } else {
                     match self.changes_mode {
-                        ChangesMode::Git => "No local Git changes.".into(),
+                        ChangesMode::Git => self.empty_git_message(),
                         ChangesMode::Unpushed => "No unpushed commits.".into(),
                     }
                 }
@@ -1863,6 +1872,18 @@ impl App {
         match self.tab {
             Tab::Changes => self.draw_diff(frame, inner, selected),
             Tab::Files => self.draw_source(frame, inner, selected),
+        }
+    }
+
+    fn empty_git_message(&self) -> String {
+        match self.unpushed_commits {
+            Some(count) if count > 0 => {
+                let commits = if count == 1 { "commit" } else { "commits" };
+                format!(
+                    "Changes are in Unpushed commits.\n\n{count} unpushed {commits}.\n\nPress g to view them."
+                )
+            }
+            _ => "No local Git changes.\n\nPress g to check Unpushed commits.".into(),
         }
     }
 
@@ -2172,11 +2193,15 @@ fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> W
         Ok(changes) => WorkResult::GitScan {
             generation,
             changes,
+            unpushed_commits: (comparison == GitComparison::WorkingTree)
+                .then(|| unpushed_commit_count(root))
+                .flatten(),
             error: None,
         },
         Err(error) => WorkResult::GitScan {
             generation,
             changes: Vec::new(),
+            unpushed_commits: None,
             error: Some(error),
         },
     }
@@ -2919,6 +2944,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn empty_git_view_points_to_unpushed_commits() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.git_state = super::GitState::Loaded;
+        app.unpushed_commits = Some(1);
+
+        let output = render(&mut app, 100, 20);
+        assert!(output.contains("Changes are in Unpushed commits."));
+        assert!(output.contains("1 unpushed commit."));
+        assert!(output.contains("Press g to view them."));
+        assert!(!output.contains("No local Git changes."));
     }
 
     #[test]

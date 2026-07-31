@@ -131,6 +131,22 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
     Ok(changes)
 }
 
+pub fn unpushed_commit_count(root: &Path) -> Option<usize> {
+    let upstream = run_git(
+        root,
+        ["rev-parse", "--verify", "--abbrev-ref", "@{upstream}"],
+    )
+    .ok()?;
+    if !upstream.status.success() {
+        return None;
+    }
+    let output = run_git(root, ["rev-list", "--count", "@{upstream}..HEAD"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
 pub fn diff(root: &Path, change: &GitChange) -> Result<Vec<DiffLine>, String> {
     let output = if change.untracked {
         let mut command = git_command(root);
