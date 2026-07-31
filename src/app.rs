@@ -281,6 +281,7 @@ enum WorkResult {
     },
     GitScan {
         generation: u64,
+        comparison: GitComparison,
         changes: Vec<GitChange>,
         unpushed_commits: Option<usize>,
         error: Option<String>,
@@ -290,6 +291,13 @@ enum WorkResult {
         index: usize,
         lines: Vec<DiffLine>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct GitScanCache {
+    changes: Vec<GitChange>,
+    unpushed_commits: Option<usize>,
+    error: Option<String>,
 }
 
 struct Cache<K, V> {
@@ -492,6 +500,7 @@ struct App {
     render_generation: u64,
     requested: BTreeSet<(Tab, usize, u64)>,
     git_diff_cache: Cache<usize, Vec<DiffLine>>,
+    git_scan_cache: [Option<GitScanCache>; 2],
     unpushed_commits: Option<usize>,
     source_cache: Cache<usize, Vec<Vec<ColoredSpan>>>,
     source_notices: Cache<usize, String>,
@@ -526,6 +535,7 @@ impl App {
             render_generation: 0,
             requested: BTreeSet::new(),
             git_diff_cache: Cache::new(),
+            git_scan_cache: [None, None],
             unpushed_commits: None,
             source_cache: Cache::new(),
             source_notices: Cache::new(),
@@ -559,6 +569,7 @@ impl App {
                     self.source_notices.clear();
                     self.git_changes.clear();
                     self.git_diff_cache.clear();
+                    self.git_scan_cache = [None, None];
                     self.unpushed_commits = None;
                     self.git_error = None;
                     self.git_state = GitState::Unloaded;
@@ -584,12 +595,18 @@ impl App {
             }
             WorkResult::GitScan {
                 generation,
+                comparison,
                 changes,
                 unpushed_commits,
                 error,
             } if generation == self.render_generation => {
                 self.git_state = GitState::Loaded;
                 self.requested.clear();
+                self.git_scan_cache[git_comparison_index(comparison)] = Some(GitScanCache {
+                    changes: changes.clone(),
+                    unpushed_commits,
+                    error: error.clone(),
+                });
                 if error.is_none() {
                     self.git_changes = changes;
                     self.git_diff_cache.clear();
@@ -624,6 +641,7 @@ impl App {
             self.requested.clear();
             self.git_changes.clear();
             self.git_diff_cache.clear();
+            self.git_scan_cache = [None, None];
             self.unpushed_commits = None;
             self.git_error = None;
             self.git_state = GitState::Unloaded;
@@ -722,7 +740,16 @@ impl App {
         self.git_diff_cache.clear();
         self.unpushed_commits = None;
         self.git_error = None;
-        self.git_state = GitState::Unloaded;
+        if let Some(cache) =
+            self.git_scan_cache[git_comparison_index(self.changes_mode.comparison())].as_ref()
+        {
+            self.git_changes = cache.changes.clone();
+            self.unpushed_commits = cache.unpushed_commits;
+            self.git_error = cache.error.clone();
+            self.git_state = GitState::Loaded;
+        } else {
+            self.git_state = GitState::Unloaded;
+        }
     }
 
     fn toggle_sidebar(&mut self) {
@@ -2192,6 +2219,7 @@ fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> W
     match scan_git(root, comparison) {
         Ok(changes) => WorkResult::GitScan {
             generation,
+            comparison,
             changes,
             unpushed_commits: (comparison == GitComparison::WorkingTree)
                 .then(|| unpushed_commit_count(root))
@@ -2200,10 +2228,18 @@ fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> W
         },
         Err(error) => WorkResult::GitScan {
             generation,
+            comparison,
             changes: Vec::new(),
             unpushed_commits: None,
             error: Some(error),
         },
+    }
+}
+
+fn git_comparison_index(comparison: GitComparison) -> usize {
+    match comparison {
+        GitComparison::WorkingTree => 0,
+        GitComparison::Unpushed => 1,
     }
 }
 
@@ -2944,6 +2980,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn g_reuses_a_loaded_comparison_without_queueing_another_scan() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.git_state = super::GitState::Loaded;
+        app.git_scan_cache[1] = Some(super::GitScanCache {
+            changes: Vec::new(),
+            unpushed_commits: None,
+            error: None,
+        });
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+
+        assert_eq!(app.changes_mode, ChangesMode::Unpushed);
+        assert_eq!(app.git_state, super::GitState::Loaded);
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]
