@@ -131,6 +131,7 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
     Ok(changes)
 }
 
+#[must_use]
 pub fn unpushed_commit_count(root: &Path) -> Option<usize> {
     let upstream = run_git(
         root,
