@@ -1,0 +1,13 @@
+/target
+/.idea
+/.vscode
+.DS_Store
+/.smoke
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.secrets/
