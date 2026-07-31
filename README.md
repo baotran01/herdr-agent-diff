@@ -1,42 +1,72 @@
-# Herdr Agent Diff
+<p align="center">
+  <a href="https://herdr.dev/">
+    <img src="https://herdr.dev/assets/logo.svg" alt="Herdr" width="190">
+  </a>
+</p>
 
-Herdr Agent Diff is a native macOS and Linux plugin for [Herdr](https://herdr.dev/) that makes local Git changes easy to inspect. It opens a read-only terminal UI beside the current pane or in a separate Herdr tab.
+<h1 align="center">Herdr Agent Diff</h1>
 
-The viewer has two tabs:
+<p align="center">
+  A fast, read-only Git review pane for <a href="https://herdr.dev/">Herdr</a>.<br>
+  See local changes, unpushed commits, and source files without leaving your terminal.
+</p>
 
-- **Changes** shows Git changes and unpushed commits. Selecting a file opens a readable code diff.
-- **Files** shows the workspace tree with language badges, line numbers, and syntax highlighting for source files.
+<p align="center">
+  <a href="https://github.com/baotran01/herdr-agent-diff/releases/latest"><img src="https://img.shields.io/github/v/release/baotran01/herdr-agent-diff?display_name=tag&style=for-the-badge&logo=github&logoColor=white&label=release" alt="Latest release"></a>
+  <a href="https://github.com/baotran01/herdr-agent-diff/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/baotran01/herdr-agent-diff/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
+  <a href="https://github.com/baotran01/herdr-agent-diff/blob/main/LICENSE"><img src="https://img.shields.io/github/license/baotran01/herdr-agent-diff?style=for-the-badge&color=blue" alt="MIT license"></a>
+</p>
 
-The Changes tab has two comparison views:
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-arm64-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS arm64">
+  <img src="https://img.shields.io/badge/Linux-x86__64-111827?style=flat-square&logo=linux&logoColor=FCC624" alt="Linux x86_64">
+  <img src="https://img.shields.io/badge/Rust-stable-111827?style=flat-square&logo=rust&logoColor=DEA584" alt="Rust stable">
+  <img src="https://img.shields.io/badge/read--only-by%20design-16a34a?style=flat-square&logo=git&logoColor=white" alt="Read-only by design">
+</p>
 
-- **Git diff** compares the working tree with `HEAD`, including staged, unstaged, deleted, renamed, and untracked files.
-- **Unpushed commits** compares `HEAD` with the branch's tracked remote (`@{upstream}`), showing committed changes that are not on the remote branch yet.
+<p align="center">
+  <a href="#-features">Features</a> ·
+  <a href="#-install">Install</a> ·
+  <a href="#-controls">Controls</a> ·
+  <a href="#-architecture">Architecture</a>
+</p>
 
-Press `g` to switch between the two Changes views. This makes it easy to see both edits that still need committing and commits that still need pushing.
+> [!TIP]
+> Press `g` in **Changes** to flip between **Git diff** and **Unpushed commits**. One pane, two answers: *what still needs committing?* and *what still needs pushing?*
 
-## Features
+```text
+┌─ Changes ─────────────────────────┬─ Diff ───────────────────────────────────┐
+│ ▾ staged/                         │  12  - fn build_snapshot()               │
+│   M src/snapshot.rs         +18 -4│  13  + fn build_snapshot()               │
+│ ▾ unstaged/                       │  14    │                                   │
+│   M src/app.rs              +42 -9│  @@ unchanged lines collapsed @@        │
+│   ? scripts/run.sh          +31   │  15  + viewer refreshes on filesystem      │
+└───────────────────────────────────┴───────────────────────────────────────────┘
+```
 
-- Combined local Git diff for staged, unstaged, deleted, renamed, and untracked files.
-- Unpushed-commit diff for committed changes ahead of the tracked remote branch.
-- A grouped, collapsible folder tree shared by the Changes and Files tabs.
-- Right-aligned per-file `+` and `-` counts in the Changes tab.
-- Unified code diffs with old/new line-number gutters, addition/deletion highlighting, and collapsed unchanged regions.
-- File browsing with an immediate plain-text preview, followed by syntax highlighting based on file extensions.
-- Text search, keyboard navigation, mouse support, and scrollbars for both the sidebar and diff pane.
-- Hideable sidebar shared by the Changes and Files tabs (`b`).
-- Read-only operation on the project workspace and Git repository.
+## ✨ Features
 
-## Tech stack
+| | What you get |
+| --- | --- |
+| 🔍 | Combined local Git diff for staged, unstaged, deleted, renamed, and untracked files |
+| 🚀 | Unpushed-commit diff for work that is ahead of `@{upstream}` |
+| 🌳 | Grouped, collapsible folder trees shared by **Changes** and **Files** |
+| 🎨 | Syntax highlighting, language badges, line numbers, and readable unified diffs |
+| 🖱️ | Mouse support, text selection, scrollbars, and keyboard navigation |
+| 🛡️ | Read-only operation: no staging, commits, pushes, or workspace rewrites |
 
-- **Language:** Rust.
-- **Terminal UI:** [`ratatui`](https://ratatui.rs/) for layout, widgets, rendering, and test backends.
-- **Terminal input and backend:** [`crossterm`](https://github.com/crossterm-rs/crossterm) for keyboard and mouse events, raw mode, alternate-screen handling, and terminal capabilities.
-- **File watching:** [`notify`](https://github.com/notify-rs/notify) for detecting workspace changes while the viewer is open.
-- **Diff parsing and syntax highlighting:** a bounded unified diff parser and [`syntect`](https://github.com/trishume/syntect) for syntax highlighting.
-- **Workspace scanning:** [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) for ignore-file-aware traversal, with platform filesystem support through [`rustix`](https://github.com/bytecodealliance/rustix) on Unix.
-- **Integration:** Native macOS arm64 and Linux x86_64 Herdr builds using read-only Git subprocesses.
+## 🧰 Tech stack
 
-## Requirements
+| Layer | Built with |
+| --- | --- |
+| Language | Rust |
+| Terminal UI | [`ratatui`](https://ratatui.rs/) |
+| Input & terminal | [`crossterm`](https://github.com/crossterm-rs/crossterm) |
+| File watching | [`notify`](https://github.com/notify-rs/notify) |
+| Diffs & highlighting | Bounded unified diff parser + [`syntect`](https://github.com/trishume/syntect) |
+| Workspace scanning | [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) + Unix-safe [`rustix`](https://github.com/bytecodealliance/rustix) reads |
+
+## 💻 Requirements
 
 - macOS on Apple silicon (`aarch64-apple-darwin`) or Linux x86_64 (`x86_64-unknown-linux-gnu`). Linux arm64 (`aarch64-unknown-linux-gnu`) is also supported when built locally.
 - Herdr 0.7.0 or newer.
@@ -47,7 +77,7 @@ Linux clipboard copying uses `wl-copy`, `xclip`, or `xsel` when available, and f
 
 Marketplace installation does not require Rust or Cargo when the matching GitHub Release is available. The installer downloads the host-specific binary and verifies its SHA-256 checksum. Rust and Cargo are only needed for a local source build or as a fallback before a release is published.
 
-## Build and install
+## 🚀 Install
 
 Install from the Herdr Marketplace:
 
@@ -120,9 +150,9 @@ command = "herdr-agent-diff.open-tab"
 description = "Git changes in tab"
 ```
 
-## Using the viewer
+## 🎛️ Using the viewer
 
-### Changes tab
+### 🔄 Changes tab
 
 The sidebar is organized by folders. Click a folder row, or place the cursor on it and press Enter, to expand or collapse that folder. Select a file to inspect its diff. Press `b` to hide or show the sidebar.
 
@@ -134,11 +164,11 @@ Git diff  ⇄  Unpushed commits
 
 Git diff answers: “What local edits are not in `HEAD`?” Unpushed commits answers: “What committed edits are ahead of the tracked remote branch?”
 
-### Files tab
+### 📄 Files tab
 
 The Files tab uses the same folder grouping, indentation, collapse behavior, selection gutter, and navigation styling as the Changes tab. Select a file to browse its current contents with line numbers and syntax highlighting. Press `b` to hide or show the sidebar, or `/` to search filenames or relative paths with a case-insensitive substring filter.
 
-### Keyboard controls
+### 🎛️ Controls
 
 | Key | Action |
 | --- | --- |
@@ -157,9 +187,9 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 
 Mouse clicks select tabs, folders, and files. Drag the sidebar or diff scrollbar to move quickly through long content. Scrolling over a pane keeps the pointer's pane active.
 
-## Diff semantics
+## 🧭 Diff semantics
 
-### Git diff
+### 🟢 Git diff
 
 Git diff compares the current working tree with `HEAD` using read-only Git commands. It includes:
 
@@ -172,7 +202,7 @@ The Changes sidebar groups files by `staged`, `unstaged`, `mixed` (both staged a
 
 This is the view for edits that still need to be committed.
 
-### Unpushed commits
+### 🔵 Unpushed commits
 
 Unpushed commits compares `HEAD` with `@{upstream}`. It shows committed changes that exist on the local branch but have not reached its tracked remote branch. It does not include current uncommitted or untracked edits; switch to Git diff for those.
 
@@ -180,7 +210,7 @@ If the branch has no upstream, the viewer explains that `git push -u` is require
 
 The plugin does not modify the index, create commits, stage files, push changes, or run write-oriented Git commands.
 
-## What the plugin reads and ignores
+## 🔒 What the plugin reads and ignores
 
 The scanner is deliberately conservative:
 
@@ -192,7 +222,7 @@ The scanner is deliberately conservative:
 
 The plugin stores only viewer mappings under `HERDR_PLUGIN_STATE_DIR`, which Herdr supplies for the installed plugin. Project files are not rewritten, and the plugin does not transmit workspace contents to a network service.
 
-## Architecture
+## 🏗️ Architecture
 
 | Module | Responsibility |
 | --- | --- |
@@ -213,7 +243,7 @@ open / open-tab ──► scan workspace ──► load Git changes ──► re
                                       └── b ──► hide/show sidebar
 ```
 
-## Development
+## 🛠️ Development
 
 Run formatting, linting, tests, and a release build before publishing changes:
 
@@ -235,7 +265,7 @@ git tag v0.1.2
 git push origin v0.1.2
 ```
 
-## Troubleshooting
+## 🩺 Troubleshooting
 
 ### The Git diff view is empty
 
@@ -253,6 +283,6 @@ Check whether it is ignored, a symbolic link, binary/invalid UTF-8, larger than 
 
 Re-run `herdr plugin link "$PWD"`, confirm that the release build succeeds, and restart Herdr or the affected pane. Check that the installed Herdr version satisfies the minimum version in `herdr-plugin.toml`.
 
-## Privacy and security
+## 🔐 Privacy and security
 
 Herdr Agent Diff is designed for local inspection. It does not embed credentials, send source files to an external service, or mutate the workspace. Git subprocesses are invoked with lock-free read behavior and fixed read-only arguments. The viewer displays workspace contents to whoever can access the local Herdr session, so use the same care as with any terminal showing source code.
