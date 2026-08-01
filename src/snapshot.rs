@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +19,6 @@ const ALWAYS_IGNORED: &[&str] = &[
     ".next",
     ".cache",
 ];
-const MAX_INSPECT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SCAN_FILES: usize = 100_000;
 
@@ -108,6 +108,59 @@ pub fn scan(root: &Path) -> Result<(BTreeMap<PathBuf, CurrentFile>, Vec<String>)
     Ok((files, notices))
 }
 
+pub fn workspace_fingerprint(root: &Path) -> Result<(u64, usize)> {
+    let root = root.canonicalize()?;
+    let mut fingerprint = 0_u64;
+    let mut files = 0_usize;
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(true)
+        .parents(true)
+        .filter_entry(|entry| !is_always_ignored(entry));
+
+    for item in builder.build() {
+        let Ok(entry) = item else {
+            continue;
+        };
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&root) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        relative.hash(&mut hasher);
+        metadata.len().hash(&mut hasher);
+        metadata
+            .modified()
+            .ok()
+            .and_then(system_time_ns)
+            .hash(&mut hasher);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            metadata.dev().hash(&mut hasher);
+            metadata.ino().hash(&mut hasher);
+        }
+        fingerprint = fingerprint.wrapping_add(hasher.finish());
+        files = files.saturating_add(1);
+    }
+    Ok((fingerprint, files))
+}
+
 pub fn safe_read(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {
     if relative
         .components()
@@ -120,40 +173,29 @@ pub fn safe_read(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 fn inspect_file(root: &Path, relative: &Path, size: u64) -> Result<TextEligibility> {
-    if size > MAX_INSPECT_FILE_BYTES {
+    if size > INLINE_TEXT_LIMIT {
         return Ok(TextEligibility::Oversized);
     }
     let file = open_read_only_beneath(root, relative)?;
     let mut reader = BufReader::new(file);
-    let mut preview = if size <= INLINE_TEXT_LIMIT {
-        Some(Vec::with_capacity(usize::try_from(size).unwrap_or(0)))
-    } else {
-        None
-    };
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    let mut read = 0_u64;
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        read = read.saturating_add(count as u64);
-        if read > MAX_INSPECT_FILE_BYTES {
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() as u64 > INLINE_TEXT_LIMIT {
             return Ok(TextEligibility::Oversized);
         }
-        if let Some(bytes) = &mut preview {
-            if read <= INLINE_TEXT_LIMIT {
-                bytes.extend_from_slice(&buffer[..count]);
-            } else {
-                preview = None;
-            }
-        }
     }
-    let text = match preview {
-        None => TextEligibility::Oversized,
-        Some(bytes) if bytes.contains(&0) => TextEligibility::Binary,
-        Some(bytes) if std::str::from_utf8(&bytes).is_err() => TextEligibility::InvalidUtf8,
-        Some(_) => TextEligibility::Text,
+    let text = if bytes.contains(&0) {
+        TextEligibility::Binary
+    } else if std::str::from_utf8(&bytes).is_err() {
+        TextEligibility::InvalidUtf8
+    } else {
+        TextEligibility::Text
     };
     Ok(text)
 }

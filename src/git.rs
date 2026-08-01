@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -329,8 +330,17 @@ fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn git_command(root: &Path) -> Command {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut safe_directory = OsString::from("safe.directory=");
+    safe_directory.push(canonical_root.as_os_str());
     let mut command = Command::new("git");
-    command.arg("-C").arg(root).env("GIT_OPTIONAL_LOCKS", "0");
+    command
+        .args(["-c"])
+        .arg(safe_directory)
+        .arg("-C")
+        .arg(canonical_root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
     command
 }
 
@@ -511,7 +521,7 @@ mod tests {
         assert!(lines.iter().any(|line| line.kind == DiffLineKind::Addition));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn scans_and_diffs_non_utf8_linux_paths() {
         use std::ffi::OsString;
