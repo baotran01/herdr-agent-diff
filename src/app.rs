@@ -305,6 +305,15 @@ struct GitScanCache {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DiffRenderMetrics {
+    rendered_len: usize,
+    width: usize,
+    line_number_width: usize,
+    additions: usize,
+    deletions: usize,
+}
+
 struct Cache<K, V> {
     entries: VecDeque<(K, V, usize)>,
     bytes: usize,
@@ -505,9 +514,11 @@ struct App {
     render_generation: u64,
     requested: BTreeSet<(Tab, usize, u64)>,
     git_diff_cache: Cache<usize, Vec<DiffLine>>,
+    diff_metrics_cache: Cache<usize, DiffRenderMetrics>,
     git_scan_cache: [Option<GitScanCache>; 2],
     unpushed_commits: Option<usize>,
     source_cache: Cache<usize, Vec<Vec<ColoredSpan>>>,
+    source_width_cache: Cache<usize, usize>,
     source_notices: Cache<usize, String>,
     scan_error: Option<String>,
     git_error: Option<String>,
@@ -540,9 +551,11 @@ impl App {
             render_generation: 0,
             requested: BTreeSet::new(),
             git_diff_cache: Cache::new(),
+            diff_metrics_cache: Cache::new(),
             git_scan_cache: [None, None],
             unpushed_commits: None,
             source_cache: Cache::new(),
+            source_width_cache: Cache::new(),
             source_notices: Cache::new(),
             scan_error: None,
             git_error: None,
@@ -556,6 +569,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_result(&mut self, result: WorkResult) {
         match result {
             WorkResult::Scan(result) if result.generation == self.generation => {
@@ -574,8 +588,10 @@ impl App {
                     self.source_notices.clear();
                     self.git_changes.clear();
                     self.git_diff_cache.clear();
+                    self.diff_metrics_cache.clear();
                     self.git_scan_cache = [None, None];
                     self.unpushed_commits = None;
+                    self.source_width_cache.clear();
                     self.git_error = None;
                     self.git_state = GitState::Unloaded;
                     self.clamp_selections();
@@ -589,8 +605,11 @@ impl App {
                 index,
                 lines,
             } if generation == self.render_generation => {
+                let width = source_content_dimensions(&lines).1;
                 let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
                 self.source_cache.insert(index, lines, bytes);
+                self.source_width_cache
+                    .insert(index, width, std::mem::size_of::<usize>());
             }
             WorkResult::Highlight {
                 generation,
@@ -598,8 +617,11 @@ impl App {
                 lines,
                 notice,
             } if generation == self.render_generation => {
+                let width = source_content_dimensions(&lines).1;
                 let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
                 self.source_cache.insert(index, lines, bytes);
+                self.source_width_cache
+                    .insert(index, width, std::mem::size_of::<usize>());
                 if let Some(notice) = notice {
                     let bytes = notice.len();
                     self.source_notices.insert(index, notice, bytes);
@@ -623,6 +645,7 @@ impl App {
                 if error.is_none() {
                     self.git_changes = changes;
                     self.git_diff_cache.clear();
+                    self.diff_metrics_cache.clear();
                     self.clamp_selections();
                 }
                 self.unpushed_commits = unpushed_commits;
@@ -633,6 +656,19 @@ impl App {
                 index,
                 lines,
             } if generation == self.render_generation => {
+                if let Some(change) = self.git_changes.get(index) {
+                    let metrics = diff_render_metrics(
+                        change.kind,
+                        &change.path,
+                        change.old_path.as_deref(),
+                        Some(&lines),
+                    );
+                    self.diff_metrics_cache.insert(
+                        index,
+                        metrics,
+                        std::mem::size_of::<DiffRenderMetrics>(),
+                    );
+                }
                 let bytes = lines.iter().map(|line| line.text.len()).sum();
                 self.git_diff_cache.insert(index, lines, bytes);
                 self.requested.remove(&(Tab::Changes, index, generation));
@@ -654,6 +690,7 @@ impl App {
             self.requested.clear();
             self.git_changes.clear();
             self.git_diff_cache.clear();
+            self.diff_metrics_cache.clear();
             self.git_scan_cache = [None, None];
             self.unpushed_commits = None;
             self.git_error = None;
@@ -751,6 +788,7 @@ impl App {
         self.requested.clear();
         self.git_changes.clear();
         self.git_diff_cache.clear();
+        self.diff_metrics_cache.clear();
         self.unpushed_commits = None;
         self.git_error = None;
         if let Some(cache) =
@@ -1567,14 +1605,23 @@ impl App {
         let (content_length_y, content_length_x) = match self.tab {
             Tab::Changes => {
                 let (kind, path, old_path, lines) = self.selected_diff(selected)?;
-                diff_content_dimensions(kind, path, old_path, lines)
+                self.diff_metrics_cache.get(&selected).map_or_else(
+                    || diff_content_dimensions(kind, path, old_path, lines),
+                    |metrics| (metrics.rendered_len, metrics.width),
+                )
             }
             Tab::Files => {
                 if self.source_notices.get(&selected).is_some() {
                     return None;
                 }
                 let lines = self.source_cache.get(&selected)?;
-                source_content_dimensions(lines)
+                (
+                    lines.len(),
+                    self.source_width_cache
+                        .get(&selected)
+                        .copied()
+                        .unwrap_or_else(|| source_content_dimensions(lines).1),
+                )
             }
         };
         Some(ContentScrollbarMetrics {
@@ -1658,7 +1705,11 @@ impl App {
         };
         let [content_area, _] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-        let (_, content_width) = source_content_dimensions(lines);
+        let content_width = self
+            .source_width_cache
+            .get(&selected)
+            .copied()
+            .unwrap_or_else(|| source_content_dimensions(lines).1);
         self.files_state.scroll_y = self
             .files_state
             .scroll_y
@@ -1949,10 +2000,14 @@ impl App {
             return;
         };
         let (symbol, color) = change_symbol(kind);
-        let (_, measured_width) = diff_content_dimensions(kind, path, old_path, lines);
-        let diff_width = measured_width.max(usize::from(content_area.width));
+        let metrics = self
+            .diff_metrics_cache
+            .get(&selected)
+            .copied()
+            .unwrap_or_else(|| diff_render_metrics(kind, path, old_path, lines));
+        let diff_width = metrics.width.max(usize::from(content_area.width));
         let header_style = Style::default().bg(DIFF_HEADER_BACKGROUND);
-        let mut rendered = vec![Line::from(vec![
+        let mut headers = vec![Line::from(vec![
             Span::styled(
                 format!("{symbol} "),
                 header_style.fg(color).add_modifier(Modifier::BOLD),
@@ -1963,7 +2018,7 @@ impl App {
             ),
         ])];
         if let Some(old_path) = old_path {
-            rendered.push(Line::from(vec![
+            headers.push(Line::from(vec![
                 Span::styled("  from ", header_style.fg(Color::DarkGray)),
                 Span::styled(
                     old_path.display().to_string(),
@@ -1972,37 +2027,40 @@ impl App {
             ]));
         }
 
-        let (additions, deletions) = lines.map_or((0, 0), diff_stats);
-        rendered[0].spans.push(Span::styled(
-            format!("    +{additions} -{deletions}"),
+        headers[0].spans.push(Span::styled(
+            format!("    +{} -{}", metrics.additions, metrics.deletions),
             header_style.fg(Color::DarkGray),
         ));
-        rendered.push(Line::styled("", Style::default().bg(DIFF_BACKGROUND)));
+        headers.push(Line::styled("", Style::default().bg(DIFF_BACKGROUND)));
 
-        let line_number_width = lines
-            .into_iter()
-            .flat_map(|lines| lines.iter().flat_map(|line| [line.old_line, line.new_line]))
-            .flatten()
-            .max()
-            .map_or(1, decimal_width);
-        rendered.extend(render_diff_rows(lines, line_number_width, diff_width));
-        let content_width = rendered
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap_or(diff_width)
-            .max(diff_width);
-        let max_scroll_y = rendered
-            .len()
-            .saturating_sub(usize::from(content_area.height));
-        let max_scroll_x = content_width.saturating_sub(usize::from(content_area.width));
+        let line_number_width = metrics.line_number_width;
+        let rendered_len = metrics.rendered_len;
+        let max_scroll_y = rendered_len.saturating_sub(usize::from(content_area.height));
+        let max_scroll_x = diff_width.saturating_sub(usize::from(content_area.width));
         let scroll_y = self.changes_state.scroll_y.min(max_scroll_y);
         let scroll_x = self.changes_state.scroll_x.min(max_scroll_x);
-        let rendered_len = rendered.len();
+        let visible_end = scroll_y
+            .saturating_add(usize::from(content_area.height))
+            .min(rendered_len);
+        let mut rendered = Vec::with_capacity(visible_end.saturating_sub(scroll_y));
+        for row in scroll_y..visible_end {
+            if let Some(header) = headers.get(row) {
+                rendered.push(header.clone());
+            } else {
+                let diff_index = row.saturating_sub(headers.len());
+                rendered.extend(render_diff_rows(
+                    lines,
+                    line_number_width,
+                    diff_width,
+                    diff_index,
+                    diff_index.saturating_add(1),
+                ));
+            }
+        }
         frame.render_widget(
             Paragraph::new(rendered)
                 .style(Style::default().fg(DIFF_TEXT).bg(DIFF_BACKGROUND))
-                .scroll((saturating_u16(scroll_y), saturating_u16(scroll_x))),
+                .scroll((0, saturating_u16(scroll_x))),
             content_area,
         );
         if max_scroll_y > 0 {
@@ -2025,11 +2083,11 @@ impl App {
             );
         }
         if max_scroll_x > 0 {
-            let mut scrollbar = ScrollbarState::new(content_width)
+            let mut scrollbar = ScrollbarState::new(diff_width)
                 .position(scrollbar_render_position(
                     scroll_x,
                     max_scroll_x,
-                    content_width,
+                    diff_width,
                 ))
                 .viewport_content_length(compact_horizontal_scrollbar_viewport(usize::from(
                     content_area.width,
@@ -2059,11 +2117,27 @@ impl App {
             frame.render_widget(Paragraph::new("").style(panel_style()), area);
             return;
         };
-        let width = lines.len().max(1).ilog10() as usize + 1;
-        let rendered: Vec<Line<'_>> = lines
+        let [content_area, horizontal_scrollbar_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let line_count = lines.len();
+        let width = line_count.max(1).ilog10() as usize + 1;
+        let content_width = self
+            .source_width_cache
+            .get(&selected)
+            .copied()
+            .unwrap_or_else(|| source_content_dimensions(lines).1);
+        let max_scroll_y = line_count.saturating_sub(usize::from(content_area.height));
+        let max_scroll_x = content_width.saturating_sub(usize::from(content_area.width));
+        let scroll_y = self.files_state.scroll_y.min(max_scroll_y);
+        let scroll_x = self.files_state.scroll_x.min(max_scroll_x);
+        let visible_end = scroll_y
+            .saturating_add(usize::from(content_area.height))
+            .min(line_count);
+        let rendered: Vec<Line<'_>> = lines[scroll_y..visible_end]
             .iter()
             .enumerate()
-            .map(|(index, spans)| {
+            .map(|(offset, spans)| {
+                let index = scroll_y.saturating_add(offset);
                 let mut output = vec![Span::styled(
                     format!("{:>width$} │ ", index + 1),
                     Style::default().fg(Color::DarkGray),
@@ -2078,17 +2152,10 @@ impl App {
                 Line::from(output)
             })
             .collect();
-        let [content_area, horizontal_scrollbar_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-        let (_, content_width) = source_content_dimensions(lines);
-        let max_scroll_y = lines.len().saturating_sub(usize::from(content_area.height));
-        let max_scroll_x = content_width.saturating_sub(usize::from(content_area.width));
-        let scroll_y = self.files_state.scroll_y.min(max_scroll_y);
-        let scroll_x = self.files_state.scroll_x.min(max_scroll_x);
         frame.render_widget(
             Paragraph::new(rendered)
                 .style(panel_style())
-                .scroll((saturating_u16(scroll_y), saturating_u16(scroll_x))),
+                .scroll((0, saturating_u16(scroll_x))),
             content_area,
         );
         if max_scroll_y > 0 {
@@ -2355,6 +2422,8 @@ fn highlight_source(
 ) -> Vec<Vec<ColoredSpan>> {
     let syntax = syntax_for_file(root, relative, syntaxes);
     let default_foreground = theme.settings.foreground;
+    let true_color = std::env::var("COLORTERM")
+        .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"));
     let mut highlighter = HighlightLines::new(syntax, theme);
     LinesWithEndings::from(text)
         .map(|line| {
@@ -2367,7 +2436,12 @@ fn highlight_source(
                     foreground: if default_foreground == Some(style.foreground) {
                         Color::White
                     } else {
-                        terminal_color(style.foreground.r, style.foreground.g, style.foreground.b)
+                        terminal_color(
+                            style.foreground.r,
+                            style.foreground.g,
+                            style.foreground.b,
+                            true_color,
+                        )
                     },
                 })
                 .collect()
@@ -2766,6 +2840,16 @@ fn diff_content_dimensions(
     old_path: Option<&Path>,
     lines: Option<&[DiffLine]>,
 ) -> (usize, usize) {
+    let metrics = diff_render_metrics(kind, path, old_path, lines);
+    (metrics.rendered_len, metrics.width)
+}
+
+fn diff_render_metrics(
+    kind: ChangeKind,
+    path: &Path,
+    old_path: Option<&Path>,
+    lines: Option<&[DiffLine]>,
+) -> DiffRenderMetrics {
     let (symbol, _) = change_symbol(kind);
     let (additions, deletions) = lines.map_or((0, 0), diff_stats);
     let mut width = format!("{symbol} {}    +{additions} -{deletions}", path.display()).width();
@@ -2779,21 +2863,28 @@ fn diff_content_dimensions(
         .flatten()
         .max()
         .map_or(1, decimal_width);
-    let diff_lines = lines.map_or_else(
-        || vec!["Generating diff…".width()],
+    let diff_width = lines.map_or_else(
+        || "Generating diff…".width(),
         |lines| {
             lines
                 .iter()
                 .map(|line| diff_line_width(line, line_number_width))
-                .collect()
+                .max()
+                .unwrap_or(0)
         },
     );
-    width = width.max(diff_lines.into_iter().max().unwrap_or(0));
+    width = width.max(diff_width);
 
     let rendered_len = 2_usize
         .saturating_add(usize::from(old_path.is_some()))
         .saturating_add(lines.map_or(1, <[DiffLine]>::len));
-    (rendered_len, width)
+    DiffRenderMetrics {
+        rendered_len,
+        width,
+        line_number_width,
+        additions,
+        deletions,
+    }
 }
 
 fn source_content_dimensions(lines: &[Vec<ColoredSpan>]) -> (usize, usize) {
@@ -2912,6 +3003,8 @@ fn render_diff_rows(
     lines: Option<&[DiffLine]>,
     line_number_width: usize,
     row_width: usize,
+    start: usize,
+    end: usize,
 ) -> Vec<Line<'static>> {
     lines.map_or_else(
         || {
@@ -2922,6 +3015,8 @@ fn render_diff_rows(
         },
         |lines| {
             lines
+                .get(start..end.min(lines.len()))
+                .unwrap_or_default()
                 .iter()
                 .map(|line| render_diff_line(line, line_number_width, row_width))
                 .collect()
@@ -3013,12 +3108,10 @@ fn saturating_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
-fn terminal_color(red: u8, green: u8, blue: u8) -> Color {
+fn terminal_color(red: u8, green: u8, blue: u8, true_color: bool) -> Color {
     let red = brighten_code_component(red);
     let green = brighten_code_component(green);
     let blue = brighten_code_component(blue);
-    let true_color = std::env::var("COLORTERM")
-        .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"));
     if true_color {
         Color::Rgb(red, green, blue)
     } else {
