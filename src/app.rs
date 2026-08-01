@@ -17,7 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::{Event as NotifyEvent, EventKind, RecursiveMode, Watcher};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
@@ -40,7 +40,7 @@ use crate::git::{
 };
 use crate::herdr::{Herdr, pane_exists};
 use crate::model::{ChangeKind, CurrentFile, TextEligibility};
-use crate::snapshot::{safe_read, scan};
+use crate::snapshot::{safe_read, scan, workspace_fingerprint};
 use crate::{Error, Result};
 
 const CACHE_LIMIT: usize = 32 * 1024 * 1024;
@@ -59,6 +59,9 @@ const DIFF_DELETION: Color = Color::Rgb(246, 120, 134);
 const DIFF_HUNK: Color = Color::Rgb(149, 180, 224);
 const FILE_ICON_SLOT_WIDTH: usize = 3;
 const HIGHLIGHT_CHUNK_LINES: usize = 256;
+const CONTAINER_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+const LARGE_WORKSPACE_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const LARGE_WORKSPACE_FILE_COUNT: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIcon {
@@ -369,13 +372,18 @@ impl<K: Eq, V> Cache<K, V> {
 pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()> {
     let canonical_root = root.canonicalize()?;
     let (watch_tx, watch_rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = watch_tx.send(event);
-    })?;
+    let polling_watcher = should_use_polling_watcher();
+    let mut watcher = WorkspaceWatcher::new(canonical_root.clone(), watch_tx, polling_watcher)?;
     let watcher_notice = watcher
         .watch(&canonical_root, RecursiveMode::Recursive)
         .err()
-        .map(|error| format!("watcher unavailable: {error}; press r to refresh"));
+        .map(|error| {
+            if polling_watcher {
+                format!("polling watcher unavailable: {error}; press r to refresh")
+            } else {
+                format!("watcher unavailable: {error}; press r to refresh")
+            }
+        });
 
     let newest_generation = Arc::new(AtomicU64::new(1));
     let (task_tx, task_rx) = mpsc::sync_channel(8);
@@ -408,24 +416,19 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
         app.request_selected(&task_tx);
         while let Ok(event) = watch_rx.try_recv() {
             match event {
-                Ok(event)
-                    if matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) =>
-                {
+                WatchMessage::Changed => {
                     dirty_since = Some(Instant::now());
                 }
-                Ok(_) => {}
-                Err(error) => {
+                WatchMessage::Error(error) => {
                     app.notices
                         .push(format!("watcher error: {error}; press r to recover"));
                     dirty_since = Some(Instant::now());
                 }
             }
         }
-        if dirty_since.is_some_and(|instant| instant.elapsed() >= Duration::from_millis(150)) {
-            app.refresh(&newest_generation, &task_tx);
+        if dirty_since.is_some_and(|instant| instant.elapsed() >= Duration::from_millis(150))
+            && app.refresh(&newest_generation, &task_tx)
+        {
             dirty_since = None;
         }
         if last_liveness.elapsed() >= Duration::from_secs(2) {
@@ -445,6 +448,155 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
         }
     }
     Ok(())
+}
+
+enum WatchMessage {
+    Changed,
+    Error(String),
+}
+
+enum WorkspaceWatcher {
+    Native(notify::RecommendedWatcher),
+    Poll(WorkspacePoller),
+}
+
+impl WorkspaceWatcher {
+    fn new(
+        root: PathBuf,
+        watch_tx: mpsc::Sender<WatchMessage>,
+        polling: bool,
+    ) -> notify::Result<Self> {
+        if polling {
+            Ok(Self::Poll(WorkspacePoller::new(root, watch_tx)))
+        } else {
+            let handler = move |event: notify::Result<NotifyEvent>| match event {
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) =>
+                {
+                    let _ = watch_tx.send(WatchMessage::Changed);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = watch_tx.send(WatchMessage::Error(error.to_string()));
+                }
+            };
+            Ok(Self::Native(notify::recommended_watcher(handler)?))
+        }
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Native(watcher) => watcher.watch(path, mode),
+            Self::Poll(watcher) => {
+                watcher.start();
+                Ok(())
+            }
+        }
+    }
+}
+
+struct WorkspacePoller {
+    root: PathBuf,
+    watch_tx: mpsc::Sender<WatchMessage>,
+    stop_tx: Option<mpsc::Sender<()>>,
+}
+
+impl WorkspacePoller {
+    fn new(root: PathBuf, watch_tx: mpsc::Sender<WatchMessage>) -> Self {
+        Self {
+            root,
+            watch_tx,
+            stop_tx: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.stop_tx.is_some() {
+            return;
+        }
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let root = self.root.clone();
+        let watch_tx = self.watch_tx.clone();
+        thread::spawn(move || {
+            let mut previous = None;
+            let mut interval = CONTAINER_WATCH_INTERVAL;
+            let mut last_error = None;
+            loop {
+                let fingerprint = workspace_fingerprint(&root);
+                match fingerprint {
+                    Ok((fingerprint, file_count)) => {
+                        interval = if file_count >= LARGE_WORKSPACE_FILE_COUNT {
+                            LARGE_WORKSPACE_WATCH_INTERVAL
+                        } else {
+                            CONTAINER_WATCH_INTERVAL
+                        };
+                        last_error = None;
+                        if previous.is_some_and(|old| old != fingerprint)
+                            && watch_tx.send(WatchMessage::Changed).is_err()
+                        {
+                            break;
+                        }
+                        previous = Some(fingerprint);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        if last_error.as_deref() != Some(message.as_str()) {
+                            let _ = watch_tx.send(WatchMessage::Error(message.clone()));
+                            last_error = Some(message);
+                        }
+                    }
+                }
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+        self.stop_tx = Some(stop_tx);
+    }
+}
+
+impl Drop for WorkspacePoller {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+    }
+}
+
+fn should_use_polling_watcher() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_container_environment()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_container_environment() -> bool {
+    ["/.dockerenv", "/run/.containerenv"]
+        .iter()
+        .any(|marker| Path::new(marker).exists())
+        || std::fs::read_to_string("/proc/1/cgroup").is_ok_and(|cgroup| {
+            cgroup.lines().any(|line| {
+                [
+                    "containerd",
+                    "docker",
+                    "kubepods",
+                    "libpod",
+                    "lxc",
+                    "podman",
+                ]
+                .iter()
+                .any(|marker| line.contains(marker))
+            })
+        })
 }
 
 struct TerminalSession {

@@ -75,6 +75,13 @@
 
 Linux clipboard copying uses `wl-copy`, `xclip`, or `xsel` when available, and falls back to the terminal's OSC 52 clipboard protocol.
 
+When the viewer runs inside Docker, Podman, or a similar Linux container, it uses
+an ignore-aware metadata poller every 500 milliseconds for smaller workspaces,
+backing off to two seconds for workspaces with 10,000 or more files. This is
+intentional: inotify events from bind-mounted host directories do not always
+cross a VM boundary. The poller skips ignored directories and never reads file
+contents. Native event watching remains the default on regular Linux hosts.
+
 Marketplace installation does not require Rust or Cargo when the matching GitHub Release is available. The installer downloads the host-specific binary and verifies its SHA-256 checksum. Rust and Cargo are only needed for a local source build or as a fallback before a release is published.
 
 ## 🚀 Install
@@ -207,6 +214,12 @@ This is the view for edits that still need to be committed.
 Unpushed commits compares `HEAD` with `@{upstream}`. It shows committed changes that exist on the local branch but have not reached its tracked remote branch. It does not include current uncommitted or untracked edits; switch to Git diff for those.
 
 If the branch has no upstream, the viewer explains that `git push -u` is required before unpushed commits can be determined.
+
+For bind-mounted repositories whose owner differs from the container user, Git's
+workspace trust check is scoped to the canonical workspace for each read-only
+command. The plugin does not change global Git configuration. If the mounted
+workspace is read-only, the viewer still works as long as Herdr's plugin state
+directory is writable.
 
 The plugin does not modify the index, create commits, stage files, push changes, or run write-oriented Git commands.
 

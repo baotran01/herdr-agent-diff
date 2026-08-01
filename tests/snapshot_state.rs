@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use herdr_agent_diff::model::{INLINE_TEXT_LIMIT, TextEligibility};
-use herdr_agent_diff::snapshot::{safe_read, scan};
+use herdr_agent_diff::snapshot::{safe_read, scan, workspace_fingerprint};
 use tempfile::TempDir;
 
 #[test]
@@ -28,6 +28,26 @@ fn scan_honors_ignore_files_and_classifies_file_content() {
     assert_eq!(
         files[Path::new("large.txt")].text,
         TextEligibility::Oversized
+    );
+}
+
+#[test]
+fn workspace_fingerprint_skips_ignored_files_and_detects_metadata_changes() {
+    let project = TempDir::new().expect("temp project");
+    fs::write(project.path().join(".gitignore"), "ignored.txt\n").expect("ignore file");
+    fs::write(project.path().join("visible.txt"), "before").expect("visible");
+
+    let initial = workspace_fingerprint(project.path()).expect("initial fingerprint");
+    fs::write(project.path().join("ignored.txt"), "ignored").expect("ignored");
+    assert_eq!(
+        workspace_fingerprint(project.path()).expect("ignored fingerprint"),
+        initial
+    );
+
+    fs::write(project.path().join("visible.txt"), "after").expect("changed");
+    assert_ne!(
+        workspace_fingerprint(project.path()).expect("changed fingerprint"),
+        initial
     );
 }
 
