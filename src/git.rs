@@ -313,6 +313,15 @@ fn change_state(statuses: &BTreeMap<PathBuf, GitFileState>, change: &GitChange) 
         .unwrap_or(GitFileState::Unstaged)
 }
 
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(std::ffi::OsString::from_vec(bytes.to_vec()).into())
+}
+
+#[cfg(not(unix))]
 fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, String> {
     String::from_utf8(bytes.to_vec())
         .map(PathBuf::from)
@@ -500,6 +509,45 @@ mod tests {
         assert_eq!(changes[0].state, GitFileState::Committed);
         let lines = diff(directory.path(), &changes[0]).expect("unpushed diff");
         assert!(lines.iter().any(|line| line.kind == DiffLineKind::Addition));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scans_and_diffs_non_utf8_linux_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = TempDir::new().expect("repository");
+        git(directory.as_ref(), ["init", "-q"]);
+        fs::write(directory.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+        git(directory.as_ref(), ["add", "tracked.txt"]);
+        git(
+            directory.as_ref(),
+            [
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        let invalid_name = OsString::from_vec(b"linux-\xff.txt".to_vec());
+        fs::write(directory.path().join(&invalid_name), "new\n").expect("write non-UTF-8 path");
+
+        let changes = scan(directory.path(), GitComparison::WorkingTree).expect("scan git changes");
+        let change = changes
+            .iter()
+            .find(|change| change.path.as_os_str() == invalid_name)
+            .expect("non-UTF-8 change");
+        assert!(change.untracked);
+        assert!(
+            diff(directory.path(), change)
+                .expect("render non-UTF-8 diff")
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Addition)
+        );
     }
 
     fn git<const N: usize>(directory: &std::path::Path, arguments: [&str; N]) {

@@ -862,6 +862,12 @@ impl App {
         newest: &AtomicU64,
         tasks: &mpsc::SyncSender<Task>,
     ) -> bool {
+        // Terminals using the enhanced keyboard protocol can report key releases in
+        // addition to presses. Treating both as input makes navigation and toggles
+        // fire twice on terminals that enable those reports (commonly on Linux).
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return false;
+        }
         if self.mode == Mode::Filter {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
@@ -3292,6 +3298,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn enhanced_keyboard_release_events_do_not_repeat_actions() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        let mut release = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        release.kind = crossterm::event::KeyEventKind::Release;
+
+        assert!(!app.handle_key(release, &newest, &tasks));
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]
