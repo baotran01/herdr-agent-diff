@@ -58,6 +58,7 @@ const DIFF_ADDITION: Color = Color::Rgb(105, 224, 150);
 const DIFF_DELETION: Color = Color::Rgb(246, 120, 134);
 const DIFF_HUNK: Color = Color::Rgb(149, 180, 224);
 const FILE_ICON_SLOT_WIDTH: usize = 3;
+const HIGHLIGHT_CHUNK_LINES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIcon {
@@ -278,10 +279,12 @@ enum WorkResult {
         index: usize,
         lines: Vec<Vec<ColoredSpan>>,
     },
-    Highlight {
+    HighlightChunk {
         generation: u64,
         index: usize,
+        start: usize,
         lines: Vec<Vec<ColoredSpan>>,
+        complete: bool,
         notice: Option<String>,
     },
     GitScan {
@@ -350,6 +353,13 @@ impl<K: Eq, V> Cache<K, V> {
             .map(|entry| &entry.1)
     }
 
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries
+            .iter_mut()
+            .find(|entry| &entry.0 == key)
+            .map(|entry| &mut entry.1)
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
@@ -369,7 +379,9 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
 
     let newest_generation = Arc::new(AtomicU64::new(1));
     let (task_tx, task_rx) = mpsc::sync_channel(8);
-    let (result_tx, result_rx) = mpsc::channel();
+    // Keep only a few completed chunks ahead of the UI. This applies backpressure to
+    // highlighting large files instead of eagerly retaining the whole styled file.
+    let (result_tx, result_rx) = mpsc::sync_channel(4);
     spawn_worker(
         canonical_root.clone(),
         Arc::clone(&newest_generation),
@@ -589,13 +601,15 @@ impl App {
             } if generation == self.render_generation => {
                 self.apply_source_preview(index, lines);
             }
-            WorkResult::Highlight {
+            WorkResult::HighlightChunk {
                 generation,
                 index,
+                start,
                 lines,
+                complete,
                 notice,
             } if generation == self.render_generation => {
-                self.apply_highlight(index, generation, lines, notice);
+                self.apply_highlight_chunk(index, start, lines, notice, complete, generation);
             }
             WorkResult::GitScan {
                 generation,
@@ -656,19 +670,29 @@ impl App {
         self.cache_source(index, lines);
     }
 
-    fn apply_highlight(
+    fn apply_highlight_chunk(
         &mut self,
         index: usize,
-        generation: u64,
+        start: usize,
         lines: Vec<Vec<ColoredSpan>>,
         notice: Option<String>,
+        complete: bool,
+        generation: u64,
     ) {
-        self.cache_source(index, lines);
+        if let Some(source) = self.source_cache.get_mut(&index) {
+            for (offset, line) in lines.into_iter().enumerate() {
+                if let Some(destination) = source.get_mut(start.saturating_add(offset)) {
+                    *destination = line;
+                }
+            }
+        }
         if let Some(notice) = notice {
             let bytes = notice.len();
             self.source_notices.insert(index, notice, bytes);
         }
-        self.requested.remove(&(Tab::Files, index, generation));
+        if complete {
+            self.requested.remove(&(Tab::Files, index, generation));
+        }
     }
 
     fn cache_source(&mut self, index: usize, lines: Vec<Vec<ColoredSpan>>) {
@@ -2281,7 +2305,7 @@ fn spawn_worker(
     root: PathBuf,
     newest_generation: Arc<AtomicU64>,
     tasks: mpsc::Receiver<Task>,
-    results: mpsc::Sender<WorkResult>,
+    results: mpsc::SyncSender<WorkResult>,
 ) {
     thread::spawn(move || {
         let syntaxes = Arc::new(OnceLock::<SyntaxSet>::new());
@@ -2321,36 +2345,15 @@ fn spawn_worker(
                     index,
                     file,
                 } => {
-                    let root = root.clone();
-                    let results = results.clone();
-                    let syntaxes = Arc::clone(&syntaxes);
-                    let theme = Arc::clone(&theme);
-                    thread::spawn(move || {
-                        let syntaxes = syntaxes.get_or_init(SyntaxSet::load_defaults_newlines);
-                        let theme = theme.get_or_init(|| {
-                            ThemeSet::load_defaults().themes["base16-ocean.dark"].clone()
-                        });
-                        let (lines, notice) = match read_source(&root, &file) {
-                            Ok(text) => {
-                                let _ = results.send(WorkResult::SourcePreview {
-                                    generation,
-                                    index,
-                                    lines: plain_source(&text),
-                                });
-                                (
-                                    highlight_source(&root, &file.relative, &text, syntaxes, theme),
-                                    None,
-                                )
-                            }
-                            Err(error) => (Vec::new(), Some(error)),
-                        };
-                        let _ = results.send(WorkResult::Highlight {
-                            generation,
-                            index,
-                            lines,
-                            notice,
-                        });
-                    });
+                    spawn_highlight_worker(
+                        root.clone(),
+                        results.clone(),
+                        Arc::clone(&syntaxes),
+                        Arc::clone(&theme),
+                        generation,
+                        index,
+                        file,
+                    );
                 }
                 Task::GitScan {
                     generation,
@@ -2373,6 +2376,60 @@ fn spawn_worker(
                         let _ = results.send(git_diff_result(&root, generation, index, &change));
                     });
                 }
+            }
+        }
+    });
+}
+
+fn spawn_highlight_worker(
+    root: PathBuf,
+    results: mpsc::SyncSender<WorkResult>,
+    syntaxes: Arc<OnceLock<SyntaxSet>>,
+    theme: Arc<OnceLock<Theme>>,
+    generation: u64,
+    index: usize,
+    file: CurrentFile,
+) {
+    thread::spawn(move || {
+        let syntaxes = syntaxes.get_or_init(SyntaxSet::load_defaults_newlines);
+        let theme =
+            theme.get_or_init(|| ThemeSet::load_defaults().themes["base16-ocean.dark"].clone());
+        match read_source(&root, &file) {
+            Ok(text) => {
+                let _ = results.send(WorkResult::SourcePreview {
+                    generation,
+                    index,
+                    lines: plain_source(&text),
+                });
+                highlight_source_chunks(
+                    &root,
+                    &file.relative,
+                    &text,
+                    syntaxes,
+                    theme,
+                    |start, lines, complete| {
+                        results
+                            .send(WorkResult::HighlightChunk {
+                                generation,
+                                index,
+                                start,
+                                lines,
+                                complete,
+                                notice: None,
+                            })
+                            .is_ok()
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = results.send(WorkResult::HighlightChunk {
+                    generation,
+                    index,
+                    start: 0,
+                    lines: Vec::new(),
+                    complete: true,
+                    notice: Some(error),
+                });
             }
         }
     });
@@ -2466,6 +2523,7 @@ fn plain_source(text: &str) -> Vec<Vec<ColoredSpan>> {
         .collect()
 }
 
+#[cfg(test)]
 fn highlight_source(
     root: &Path,
     relative: &Path,
@@ -2473,13 +2531,32 @@ fn highlight_source(
     syntaxes: &SyntaxSet,
     theme: &syntect::highlighting::Theme,
 ) -> Vec<Vec<ColoredSpan>> {
+    let mut highlighted = Vec::new();
+    highlight_source_chunks(root, relative, text, syntaxes, theme, |_, mut lines, _| {
+        highlighted.append(&mut lines);
+        true
+    });
+    highlighted
+}
+
+fn highlight_source_chunks(
+    root: &Path,
+    relative: &Path,
+    text: &str,
+    syntaxes: &SyntaxSet,
+    theme: &syntect::highlighting::Theme,
+    mut emit: impl FnMut(usize, Vec<Vec<ColoredSpan>>, bool) -> bool,
+) {
     let syntax = syntax_for_file(root, relative, syntaxes);
     let default_foreground = theme.settings.foreground;
     let true_color = std::env::var("COLORTERM")
         .is_ok_and(|value| matches!(value.as_str(), "truecolor" | "24bit"));
     let mut highlighter = HighlightLines::new(syntax, theme);
-    LinesWithEndings::from(text)
-        .map(|line| {
+    let mut chunk = Vec::with_capacity(HIGHLIGHT_CHUNK_LINES);
+    let mut start = 0;
+    let mut lines = LinesWithEndings::from(text).peekable();
+    while let Some(line) = lines.next() {
+        chunk.push(
             highlighter
                 .highlight_line(line, syntaxes)
                 .unwrap_or_default()
@@ -2497,9 +2574,20 @@ fn highlight_source(
                         )
                     },
                 })
-                .collect()
-        })
-        .collect()
+                .collect(),
+        );
+        if chunk.len() == HIGHLIGHT_CHUNK_LINES || lines.peek().is_none() {
+            let complete = lines.peek().is_none();
+            let count = chunk.len();
+            if !emit(start, std::mem::take(&mut chunk), complete) {
+                return;
+            }
+            start = start.saturating_add(count);
+        }
+    }
+    if start == 0 {
+        let _ = emit(0, Vec::new(), true);
+    }
 }
 
 fn syntax_for_file<'a>(
@@ -3198,7 +3286,8 @@ mod tests {
     use super::base64_encode;
     use super::{
         App, Cache, ChangesMode, FileSearchIndex, Focus, Tab, Task, WorkResult,
-        brighten_code_component, file_icon, highlight_file, saturating_u16, syntax_for_file,
+        brighten_code_component, file_icon, highlight_file, highlight_source_chunks,
+        saturating_u16, syntax_for_file,
     };
     use crate::diff::{DiffLine, DiffLineKind};
     use crate::git::{GitChange, GitComparison, GitFileState};
@@ -3462,6 +3551,62 @@ mod tests {
 
         assert!(output.contains("fn main() {}"));
         assert!(!output.contains("Highlighting source"));
+    }
+
+    #[test]
+    fn highlight_chunks_replace_only_their_preview_lines() {
+        let mut app = App::new("w1:p1".into());
+        app.render_generation = 3;
+        app.requested.insert((Tab::Files, 0, 3));
+        app.apply_result(WorkResult::SourcePreview {
+            generation: 3,
+            index: 0,
+            lines: vec![
+                vec![super::ColoredSpan {
+                    text: "first".into(),
+                    foreground: Color::White,
+                }],
+                vec![super::ColoredSpan {
+                    text: "second".into(),
+                    foreground: Color::White,
+                }],
+            ],
+        });
+
+        app.apply_result(WorkResult::HighlightChunk {
+            generation: 3,
+            index: 0,
+            start: 1,
+            lines: vec![vec![super::ColoredSpan {
+                text: "second".into(),
+                foreground: Color::Cyan,
+            }]],
+            complete: false,
+            notice: None,
+        });
+
+        let lines = app.source_cache.get(&0).expect("source preview");
+        assert_eq!(lines[0][0].foreground, Color::White);
+        assert_eq!(lines[1][0].foreground, Color::Cyan);
+        assert!(app.requested.contains(&(Tab::Files, 0, 3)));
+
+        app.apply_result(WorkResult::HighlightChunk {
+            generation: 3,
+            index: 0,
+            start: 0,
+            lines: vec![vec![super::ColoredSpan {
+                text: "first".into(),
+                foreground: Color::Green,
+            }]],
+            complete: true,
+            notice: None,
+        });
+
+        assert!(!app.requested.contains(&(Tab::Files, 0, 3)));
+        assert_eq!(
+            app.source_cache.get(&0).expect("source preview")[0][0].foreground,
+            Color::Green
+        );
     }
 
     #[test]
@@ -4180,6 +4325,34 @@ mod tests {
             lines[0]
                 .iter()
                 .any(|span| span.foreground == ratatui::style::Color::White)
+        );
+    }
+
+    #[test]
+    fn large_sources_are_highlighted_in_bounded_chunks() {
+        let syntaxes = syntect::parsing::SyntaxSet::load_defaults_newlines();
+        let themes = syntect::highlighting::ThemeSet::load_defaults();
+        let text = "let value = 1;\n".repeat(super::HIGHLIGHT_CHUNK_LINES + 1);
+        let mut emissions = Vec::new();
+
+        highlight_source_chunks(
+            Path::new("/tmp/project"),
+            Path::new("large.js"),
+            &text,
+            &syntaxes,
+            &themes.themes["base16-ocean.dark"],
+            |start, lines, complete| {
+                emissions.push((start, lines.len(), complete));
+                true
+            },
+        );
+
+        assert_eq!(
+            emissions,
+            vec![
+                (0, super::HIGHLIGHT_CHUNK_LINES, false),
+                (super::HIGHLIGHT_CHUNK_LINES, 1, true),
+            ]
         );
     }
 
