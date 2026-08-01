@@ -570,7 +570,7 @@ impl Drop for WorkspacePoller {
 fn should_use_polling_watcher() -> bool {
     #[cfg(target_os = "linux")]
     {
-        return linux_container_environment();
+        linux_container_environment()
     }
     #[cfg(not(target_os = "linux"))]
     {
