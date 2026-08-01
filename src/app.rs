@@ -428,7 +428,6 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
             match event::read()? {
                 Event::Key(key) if app.handle_key(key, &newest_generation, &task_tx) => break,
                 Event::Mouse(mouse) => app.handle_mouse(mouse, &newest_generation, &task_tx),
-                Event::FocusGained | Event::FocusLost => {}
                 _ => {}
             }
         }
@@ -2333,13 +2332,7 @@ fn spawn_worker(
                                     lines: plain_source(&text),
                                 });
                                 (
-                                    highlight_source(
-                                        &root,
-                                        &file.relative,
-                                        &text,
-                                        &syntaxes,
-                                        &theme,
-                                    ),
+                                    highlight_source(&root, &file.relative, &text, syntaxes, theme),
                                     None,
                                 )
                             }
