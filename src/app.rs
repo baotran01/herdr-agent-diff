@@ -569,6 +569,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_result(&mut self, result: WorkResult) {
         match result {
             WorkResult::Scan(result) if result.generation == self.generation => {
