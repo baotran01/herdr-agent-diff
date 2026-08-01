@@ -3,7 +3,7 @@ use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use notify::{RecursiveMode, Watcher};
+use notify::{EventKind, RecursiveMode, Watcher};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
@@ -28,7 +28,7 @@ use ratatui::widgets::{
     ScrollbarState, Tabs, Wrap,
 };
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -396,7 +396,15 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
         app.request_selected(&task_tx);
         while let Ok(event) = watch_rx.try_recv() {
             match event {
-                Ok(_) => dirty_since = Some(Instant::now()),
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) =>
+                {
+                    dirty_since = Some(Instant::now());
+                }
+                Ok(_) => {}
                 Err(error) => {
                     app.notices
                         .push(format!("watcher error: {error}; press r to recover"));
@@ -420,9 +428,6 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
             match event::read()? {
                 Event::Key(key) if app.handle_key(key, &newest_generation, &task_tx) => break,
                 Event::Mouse(mouse) => app.handle_mouse(mouse, &newest_generation, &task_tx),
-                Event::FocusGained => {
-                    app.refresh(&newest_generation, &task_tx);
-                }
                 _ => {}
             }
         }
@@ -509,6 +514,7 @@ struct App {
     file_search_index: FileSearchIndex,
     notices: Vec<String>,
     loading: bool,
+    initial_scan_pending: bool,
     mode: Mode,
     generation: u64,
     render_generation: u64,
@@ -546,6 +552,7 @@ impl App {
             file_search_index: FileSearchIndex::default(),
             notices: Vec::new(),
             loading: true,
+            initial_scan_pending: true,
             mode: Mode::Normal,
             generation: 1,
             render_generation: 0,
@@ -573,43 +580,14 @@ impl App {
     fn apply_result(&mut self, result: WorkResult) {
         match result {
             WorkResult::Scan(result) if result.generation == self.generation => {
-                let ScanResult {
-                    files,
-                    notices,
-                    error,
-                    ..
-                } = *result;
-                self.render_generation = self.render_generation.saturating_add(1);
-                self.requested.clear();
-                if error.is_none() {
-                    self.files = files;
-                    self.file_search_index = FileSearchIndex::from_files(&self.files);
-                    self.source_cache.clear();
-                    self.source_notices.clear();
-                    self.git_changes.clear();
-                    self.git_diff_cache.clear();
-                    self.diff_metrics_cache.clear();
-                    self.git_scan_cache = [None, None];
-                    self.unpushed_commits = None;
-                    self.source_width_cache.clear();
-                    self.git_error = None;
-                    self.git_state = GitState::Unloaded;
-                    self.clamp_selections();
-                }
-                self.scan_error = error;
-                self.notices = notices;
-                self.loading = false;
+                self.apply_scan_result(*result);
             }
             WorkResult::SourcePreview {
                 generation,
                 index,
                 lines,
             } if generation == self.render_generation => {
-                let width = source_content_dimensions(&lines).1;
-                let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
-                self.source_cache.insert(index, lines, bytes);
-                self.source_width_cache
-                    .insert(index, width, std::mem::size_of::<usize>());
+                self.apply_source_preview(index, lines);
             }
             WorkResult::Highlight {
                 generation,
@@ -617,16 +595,7 @@ impl App {
                 lines,
                 notice,
             } if generation == self.render_generation => {
-                let width = source_content_dimensions(&lines).1;
-                let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
-                self.source_cache.insert(index, lines, bytes);
-                self.source_width_cache
-                    .insert(index, width, std::mem::size_of::<usize>());
-                if let Some(notice) = notice {
-                    let bytes = notice.len();
-                    self.source_notices.insert(index, notice, bytes);
-                }
-                self.requested.remove(&(Tab::Files, index, generation));
+                self.apply_highlight(index, generation, lines, notice);
             }
             WorkResult::GitScan {
                 generation,
@@ -635,46 +604,122 @@ impl App {
                 unpushed_commits,
                 error,
             } if generation == self.render_generation => {
-                self.git_state = GitState::Loaded;
-                self.requested.clear();
-                self.git_scan_cache[git_comparison_index(comparison)] = Some(GitScanCache {
-                    changes: changes.clone(),
-                    unpushed_commits,
-                    error: error.clone(),
-                });
-                if error.is_none() {
-                    self.git_changes = changes;
-                    self.git_diff_cache.clear();
-                    self.diff_metrics_cache.clear();
-                    self.clamp_selections();
-                }
-                self.unpushed_commits = unpushed_commits;
-                self.git_error = error;
+                self.apply_git_scan(comparison, changes, unpushed_commits, error);
             }
             WorkResult::GitDiff {
                 generation,
                 index,
                 lines,
             } if generation == self.render_generation => {
-                if let Some(change) = self.git_changes.get(index) {
-                    let metrics = diff_render_metrics(
-                        change.kind,
-                        &change.path,
-                        change.old_path.as_deref(),
-                        Some(&lines),
-                    );
-                    self.diff_metrics_cache.insert(
-                        index,
-                        metrics,
-                        std::mem::size_of::<DiffRenderMetrics>(),
-                    );
-                }
-                let bytes = lines.iter().map(|line| line.text.len()).sum();
-                self.git_diff_cache.insert(index, lines, bytes);
-                self.requested.remove(&(Tab::Changes, index, generation));
+                self.apply_git_diff(index, generation, lines);
             }
             _ => {}
         }
+    }
+
+    fn apply_scan_result(&mut self, result: ScanResult) {
+        let ScanResult {
+            files,
+            notices,
+            error,
+            ..
+        } = result;
+        let initial_scan = self.initial_scan_pending && self.render_generation <= 1;
+        self.initial_scan_pending = false;
+        if !initial_scan {
+            self.render_generation = self.render_generation.saturating_add(1);
+            self.requested.clear();
+        }
+        if error.is_none() {
+            self.files = files;
+            self.file_search_index = FileSearchIndex::from_files(&self.files);
+            self.source_cache.clear();
+            self.source_notices.clear();
+            self.source_width_cache.clear();
+            if !initial_scan {
+                self.git_changes.clear();
+                self.git_diff_cache.clear();
+                self.diff_metrics_cache.clear();
+                self.git_scan_cache = [None, None];
+                self.unpushed_commits = None;
+                self.git_error = None;
+                self.git_state = GitState::Unloaded;
+            }
+            self.clamp_selections();
+        }
+        self.scan_error = error;
+        self.notices = notices;
+        self.loading = false;
+    }
+
+    fn apply_source_preview(&mut self, index: usize, lines: Vec<Vec<ColoredSpan>>) {
+        self.cache_source(index, lines);
+    }
+
+    fn apply_highlight(
+        &mut self,
+        index: usize,
+        generation: u64,
+        lines: Vec<Vec<ColoredSpan>>,
+        notice: Option<String>,
+    ) {
+        self.cache_source(index, lines);
+        if let Some(notice) = notice {
+            let bytes = notice.len();
+            self.source_notices.insert(index, notice, bytes);
+        }
+        self.requested.remove(&(Tab::Files, index, generation));
+    }
+
+    fn cache_source(&mut self, index: usize, lines: Vec<Vec<ColoredSpan>>) {
+        let width = source_content_dimensions(&lines).1;
+        let bytes = lines.iter().flatten().map(|span| span.text.len()).sum();
+        self.source_cache.insert(index, lines, bytes);
+        self.source_width_cache
+            .insert(index, width, std::mem::size_of::<usize>());
+    }
+
+    fn apply_git_scan(
+        &mut self,
+        comparison: GitComparison,
+        changes: Vec<GitChange>,
+        unpushed_commits: Option<usize>,
+        error: Option<String>,
+    ) {
+        self.git_state = GitState::Loaded;
+        self.requested.clear();
+        self.git_scan_cache[git_comparison_index(comparison)] = Some(GitScanCache {
+            changes: changes.clone(),
+            unpushed_commits,
+            error: error.clone(),
+        });
+        if error.is_none() {
+            self.git_changes = changes;
+            self.git_diff_cache.clear();
+            self.diff_metrics_cache.clear();
+            self.clamp_selections();
+        }
+        self.unpushed_commits = unpushed_commits;
+        self.git_error = error;
+    }
+
+    fn apply_git_diff(&mut self, index: usize, generation: u64, lines: Vec<DiffLine>) {
+        if let Some(change) = self.git_changes.get(index) {
+            let metrics = diff_render_metrics(
+                change.kind,
+                &change.path,
+                change.old_path.as_deref(),
+                Some(&lines),
+            );
+            self.diff_metrics_cache.insert(
+                index,
+                metrics,
+                std::mem::size_of::<DiffRenderMetrics>(),
+            );
+        }
+        let bytes = lines.iter().map(|line| line.text.len()).sum();
+        self.git_diff_cache.insert(index, lines, bytes);
+        self.requested.remove(&(Tab::Changes, index, generation));
     }
 
     fn refresh(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) -> bool {
@@ -702,9 +747,6 @@ impl App {
     }
 
     fn request_selected(&mut self, tasks: &mpsc::SyncSender<Task>) {
-        if self.loading {
-            return;
-        }
         if self.tab == Tab::Changes && self.git_state != GitState::Loaded {
             if self.git_state == GitState::Loading {
                 return;
@@ -721,6 +763,9 @@ impl App {
             {
                 self.git_state = GitState::Loading;
             }
+            return;
+        }
+        if self.loading {
             return;
         }
         let Some(selected) = self.actual_selected() else {
@@ -2233,33 +2278,37 @@ fn spawn_worker(
     results: mpsc::Sender<WorkResult>,
 ) {
     thread::spawn(move || {
-        let syntaxes = Arc::new(SyntaxSet::load_defaults_newlines());
-        let themes = ThemeSet::load_defaults();
-        let theme = Arc::new(themes.themes["base16-ocean.dark"].clone());
+        let syntaxes = Arc::new(OnceLock::<SyntaxSet>::new());
+        let theme = Arc::new(OnceLock::<Theme>::new());
         while let Ok(task) = tasks.recv() {
             match task {
                 Task::Scan(generation) => {
-                    if newest_generation.load(Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    let result = match scan(&root) {
-                        Ok((map, notices)) => WorkResult::Scan(Box::new(ScanResult {
-                            generation,
-                            files: map.into_values().collect(),
-                            notices,
-                            error: None,
-                        })),
-                        Err(error) => WorkResult::Scan(Box::new(ScanResult {
-                            generation,
-                            files: Vec::new(),
-                            notices: Vec::new(),
-                            error: Some(error.to_string()),
-                        })),
-                    };
-                    if newest_generation.load(Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    let _ = results.send(result);
+                    let root = root.clone();
+                    let newest_generation = Arc::clone(&newest_generation);
+                    let results = results.clone();
+                    thread::spawn(move || {
+                        if newest_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        let result = match scan(&root) {
+                            Ok((map, notices)) => WorkResult::Scan(Box::new(ScanResult {
+                                generation,
+                                files: map.into_values().collect(),
+                                notices,
+                                error: None,
+                            })),
+                            Err(error) => WorkResult::Scan(Box::new(ScanResult {
+                                generation,
+                                files: Vec::new(),
+                                notices: Vec::new(),
+                                error: Some(error.to_string()),
+                            })),
+                        };
+                        if newest_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        let _ = results.send(result);
+                    });
                 }
                 Task::Highlight {
                     generation,
@@ -2271,6 +2320,10 @@ fn spawn_worker(
                     let syntaxes = Arc::clone(&syntaxes);
                     let theme = Arc::clone(&theme);
                     thread::spawn(move || {
+                        let syntaxes = syntaxes.get_or_init(SyntaxSet::load_defaults_newlines);
+                        let theme = theme.get_or_init(|| {
+                            ThemeSet::load_defaults().themes["base16-ocean.dark"].clone()
+                        });
                         let (lines, notice) = match read_source(&root, &file) {
                             Ok(text) => {
                                 let _ = results.send(WorkResult::SourcePreview {
@@ -2279,13 +2332,7 @@ fn spawn_worker(
                                     lines: plain_source(&text),
                                 });
                                 (
-                                    highlight_source(
-                                        &root,
-                                        &file.relative,
-                                        &text,
-                                        &syntaxes,
-                                        &theme,
-                                    ),
+                                    highlight_source(&root, &file.relative, &text, syntaxes, theme),
                                     None,
                                 )
                             }
