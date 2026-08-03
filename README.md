@@ -105,7 +105,7 @@ herdr plugin install baotran01/herdr-agent-diff --yes
 To install a specific release, use its tag:
 
 ```sh
-herdr plugin install baotran01/herdr-agent-diff --ref v0.1.2 --yes
+herdr plugin install baotran01/herdr-agent-diff --ref v0.1.3 --yes
 ```
 
 Reinstalling replaces the managed checkout and reruns `scripts/install.sh`. The installer detects macOS or Linux, atomically replaces the binary after a successful download/build, and preserves an existing binary if the update fails. Close any already-open viewer pane and reopen it so Herdr starts the new binary.
@@ -279,8 +279,8 @@ GitHub Actions runs formatting, Clippy, tests, and macOS arm64/Linux x86_64 rele
 
 ```sh
 # Use a tag matching the version in Cargo.toml and herdr-plugin.toml.
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ## 🩺 Troubleshooting
