@@ -1878,7 +1878,7 @@ impl App {
         self.clamp_source_scroll(layout.content);
         let tab_index = usize::from(self.tab == Tab::Files);
         frame.render_widget(
-            Tabs::new(["1 Changes", "2 Files"])
+            Tabs::new(["Changes", "Files"])
                 .select(tab_index)
                 .highlight_style(Style::default().fg(Color::Cyan).bold()),
             layout.tabs,
@@ -3014,8 +3014,8 @@ fn tab_at(area: Rect, column: u16, row: u16) -> Option<Tab> {
         return None;
     }
     let relative = usize::from(column.saturating_sub(area.x));
-    let changes_width = "1 Changes".len() + 2;
-    let files_width = "2 Files".len() + 2;
+    let changes_width = "Changes".len() + 2;
+    let files_width = "Files".len() + 2;
     if relative < changes_width + 1 {
         Some(Tab::Changes)
     } else if relative < changes_width + 1 + files_width {
