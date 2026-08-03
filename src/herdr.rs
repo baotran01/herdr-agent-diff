@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -132,8 +133,9 @@ fn open_or_focus_at(
             "right".into(),
             "--env".into(),
             format!("HERDR_AGENT_DIFF_TARGET_PANE={target}"),
-            "--focus".into(),
         ]);
+        add_root_environment(&mut arguments, context.cwd.as_deref());
+        arguments.push("--focus".into());
     } else {
         let workspace = context
             .workspace_id
@@ -146,11 +148,21 @@ fn open_or_focus_at(
             format!("HERDR_AGENT_DIFF_TARGET_PANE={target}"),
             "--env".into(),
             format!("HERDR_AGENT_DIFF_VIEWER_PLACEMENT={}", placement.as_str()),
-            "--focus".into(),
         ]);
+        add_root_environment(&mut arguments, context.cwd.as_deref());
+        arguments.push("--focus".into());
     }
     checked(herdr, &arguments)?;
     Ok(())
+}
+
+fn add_root_environment(arguments: &mut Vec<String>, cwd: Option<&Path>) {
+    if let Some(cwd) = cwd {
+        arguments.extend([
+            "--env".into(),
+            format!("HERDR_AGENT_DIFF_ROOT={}", cwd.to_string_lossy()),
+        ]);
+    }
 }
 
 pub fn register_viewer(store: &StateStore, target_pane_id: &str) -> Result<()> {

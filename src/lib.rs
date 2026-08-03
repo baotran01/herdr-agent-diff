@@ -4,6 +4,7 @@ pub mod diff;
 pub mod git;
 pub mod herdr;
 pub mod model;
+mod project;
 pub mod snapshot;
 pub mod state;
 

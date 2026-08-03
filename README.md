@@ -229,6 +229,11 @@ The scanner is deliberately conservative:
 
 - It never follows symbolic links while scanning the workspace.
 - It honors supported ignore files, including `.gitignore` and `.ignore`.
+- If `.bazelproject` or `.eclipse/.bazelproject` is found in the workspace or
+  one of its ancestors up to the Git root, it limits the Files and Git views to
+  the paths listed in its `directories:` section and honors `-` directory
+  exclusions. Repositories without that file keep the normal full-workspace
+  view.
 - It excludes common repository metadata and generated directories such as `.git`, `.hg`, `.svn`, `node_modules`, `target`, `dist`, `.next`, and `.cache`.
 - It limits individual text reads to 2 MiB and skips binary or invalid UTF-8 content from inline source browsing.
 - It applies file-count, file-size, scan-byte, and Git-output limits to keep the viewer responsive.

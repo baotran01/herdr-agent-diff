@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 
 use crate::diff::{DiffLine, parse_unified_diff};
 use crate::model::ChangeKind;
+use crate::project::ProjectScope;
 
 const MAX_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
@@ -48,6 +49,7 @@ pub struct GitChange {
 
 pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, String> {
     ensure_head(root)?;
+    let scope = ProjectScope::discover(root);
     let reference = match comparison {
         GitComparison::WorkingTree => "HEAD",
         GitComparison::Unpushed => {
@@ -69,6 +71,7 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
         root,
         [
             "diff",
+            "--relative",
             "--name-status",
             "-z",
             "--find-renames",
@@ -127,6 +130,15 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
                 });
             }
         }
+    }
+    if let Some(scope) = scope {
+        changes.retain(|change| {
+            scope.contains_path(root, &change.path)
+                || change
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|path| scope.contains_path(root, path))
+        });
     }
     changes.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(changes)
@@ -462,6 +474,110 @@ mod tests {
             untracked_lines
                 .iter()
                 .any(|line| line.kind == DiffLineKind::Addition)
+        );
+    }
+
+    #[test]
+    fn bazelproject_limits_working_tree_changes_to_selected_directories() {
+        let directory = TempDir::new().expect("repository");
+        git(directory.as_ref(), ["init", "-q"]);
+        fs::create_dir_all(directory.path().join(".eclipse")).expect("eclipse directory");
+        fs::create_dir_all(directory.path().join("java/selected")).expect("selected directory");
+        fs::create_dir_all(directory.path().join("java/other")).expect("other directory");
+        fs::write(
+            directory.path().join(".eclipse/.bazelproject"),
+            "directories:\n  java/selected\n",
+        )
+        .expect("project view");
+        fs::write(directory.path().join("java/selected/Main.java"), "before\n")
+            .expect("selected tracked");
+        fs::write(directory.path().join("java/other/Other.java"), "before\n")
+            .expect("other tracked");
+        git(directory.as_ref(), ["add", "."]);
+        git(
+            directory.as_ref(),
+            [
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        fs::write(
+            directory.path().join("java/selected/Main.java"),
+            "before\nafter\n",
+        )
+        .expect("selected modified");
+        fs::write(
+            directory.path().join("java/other/Other.java"),
+            "before\nafter\n",
+        )
+        .expect("other modified");
+        fs::write(
+            directory.path().join("java/selected/Added.java"),
+            "selected\n",
+        )
+        .expect("selected untracked");
+        fs::write(directory.path().join("java/other/Added.java"), "other\n")
+            .expect("other untracked");
+
+        let changes = scan(directory.path(), GitComparison::WorkingTree).expect("scan changes");
+        let paths: Vec<_> = changes.iter().map(|change| &change.path).collect();
+        assert_eq!(
+            paths,
+            [
+                std::path::Path::new("java/selected/Added.java"),
+                std::path::Path::new("java/selected/Main.java")
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestor_bazelproject_limits_changes_from_a_nested_git_workspace() {
+        let repository = TempDir::new().expect("repository");
+        git(repository.as_ref(), ["init", "-q"]);
+        fs::write(
+            repository.path().join(".bazelproject"),
+            "directories:\n  project/java/selected\n",
+        )
+        .expect("project view");
+        let project = repository.path().join("project");
+        fs::create_dir_all(project.join("java/selected")).expect("selected directory");
+        fs::create_dir_all(project.join("java/other")).expect("other directory");
+        fs::write(project.join("java/selected/Main.java"), "before\n").expect("selected tracked");
+        fs::write(project.join("java/other/Other.java"), "before\n").expect("other tracked");
+        git(repository.as_ref(), ["add", "."]);
+        git(
+            repository.as_ref(),
+            [
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        fs::write(project.join("java/selected/Main.java"), "before\nafter\n")
+            .expect("selected modified");
+        fs::write(project.join("java/other/Other.java"), "before\nafter\n")
+            .expect("other modified");
+        fs::write(project.join("java/selected/Added.java"), "selected\n")
+            .expect("selected untracked");
+        fs::write(project.join("java/other/Added.java"), "other\n").expect("other untracked");
+
+        let changes = scan(&project, GitComparison::WorkingTree).expect("scan changes");
+        let paths: Vec<_> = changes.iter().map(|change| &change.path).collect();
+        assert_eq!(
+            paths,
+            [
+                std::path::Path::new("java/selected/Added.java"),
+                std::path::Path::new("java/selected/Main.java")
+            ]
         );
     }
 

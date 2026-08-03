@@ -125,6 +125,8 @@ fn open_uses_exact_documented_plugin_pane_arguments() {
             "right",
             "--env",
             "HERDR_AGENT_DIFF_TARGET_PANE=w1:p1",
+            "--env",
+            "HERDR_AGENT_DIFF_ROOT=/tmp/project",
             "--focus",
         ]
     );
@@ -157,6 +159,8 @@ fn open_tab_uses_tab_placement_and_keeps_split_opening_available() {
             "HERDR_AGENT_DIFF_TARGET_PANE=w1:p1",
             "--env",
             "HERDR_AGENT_DIFF_VIEWER_PLACEMENT=tab",
+            "--env",
+            "HERDR_AGENT_DIFF_ROOT=/tmp/project",
             "--focus",
         ]
     );

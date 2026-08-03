@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{CurrentFile, INLINE_TEXT_LIMIT, TextEligibility};
+use crate::project::ProjectScope;
 use crate::{Error, Result};
 use ignore::{DirEntry, WalkBuilder};
 
@@ -24,23 +25,12 @@ const MAX_SCAN_FILES: usize = 100_000;
 
 pub fn scan(root: &Path) -> Result<(BTreeMap<PathBuf, CurrentFile>, Vec<String>)> {
     let root = root.canonicalize()?;
+    let scope = ProjectScope::discover(&root);
     let mut files = BTreeMap::new();
     let mut notices = Vec::new();
     let mut scanned_bytes = 0_u64;
     let mut scanned_files = 0_usize;
-    let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(false)
-        .follow_links(false)
-        .git_ignore(true)
-        .require_git(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(true)
-        .parents(true)
-        .filter_entry(|entry| !is_always_ignored(entry));
-
-    for item in builder.build() {
+    for item in workspace_walker(&root, scope.as_ref()).build() {
         let entry = match item {
             Ok(entry) => entry,
             Err(error) => {
@@ -110,21 +100,11 @@ pub fn scan(root: &Path) -> Result<(BTreeMap<PathBuf, CurrentFile>, Vec<String>)
 
 pub fn workspace_fingerprint(root: &Path) -> Result<(u64, usize)> {
     let root = root.canonicalize()?;
+    let scope = ProjectScope::discover(&root);
     let mut fingerprint = 0_u64;
     let mut files = 0_usize;
-    let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(false)
-        .follow_links(false)
-        .git_ignore(true)
-        .require_git(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(true)
-        .parents(true)
-        .filter_entry(|entry| !is_always_ignored(entry));
-
-    for item in builder.build() {
+    add_project_view_fingerprint(scope.as_ref(), &mut fingerprint);
+    for item in workspace_walker(&root, scope.as_ref()).build() {
         let Ok(entry) = item else {
             continue;
         };
@@ -159,6 +139,53 @@ pub fn workspace_fingerprint(root: &Path) -> Result<(u64, usize)> {
         files = files.saturating_add(1);
     }
     Ok((fingerprint, files))
+}
+
+fn workspace_walker(root: &Path, scope: Option<&ProjectScope>) -> WalkBuilder {
+    let scope_for_filter = scope.cloned();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        // A remote checkout may be mounted without its .git directory. The
+        // workspace's .gitignore files are still the source of truth for the
+        // file browser, so do not require Git metadata before applying them.
+        .git_ignore(true)
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(true)
+        .parents(true)
+        .filter_entry(move |entry| {
+            if is_always_ignored(entry) {
+                return false;
+            }
+            scope_for_filter.as_ref().is_none_or(|scope| {
+                entry
+                    .file_type()
+                    .is_none_or(|file_type| scope.allows_entry(entry.path(), file_type.is_dir()))
+            })
+        });
+    builder
+}
+
+fn add_project_view_fingerprint(scope: Option<&ProjectScope>, fingerprint: &mut u64) {
+    let Some(scope) = scope else {
+        return;
+    };
+    let path = scope.view_path();
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata
+        .modified()
+        .ok()
+        .and_then(system_time_ns)
+        .hash(&mut hasher);
+    *fingerprint = fingerprint.wrapping_add(hasher.finish());
 }
 
 pub fn safe_read(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {
