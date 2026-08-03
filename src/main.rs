@@ -1,7 +1,7 @@
 use herdr_agent_diff::app;
 use herdr_agent_diff::context::PluginContext;
 use herdr_agent_diff::herdr::{
-    ProcessHerdr, open_or_focus, open_or_focus_tab, pane_left_neighbor, pane_root,
+    Herdr, ProcessHerdr, open_or_focus, open_or_focus_tab, pane_left_neighbor, pane_root,
     register_viewer_for,
 };
 use herdr_agent_diff::state::StateStore;
@@ -76,8 +76,21 @@ fn handle_view(store: &StateStore) -> Result<()> {
         target: target.clone(),
         placement,
     };
-    let root = pane_root(&herdr, &target)?;
+    let root = viewer_root(&herdr, &target)?;
     app::run(&root, target, &herdr)
+}
+
+fn viewer_root(herdr: &impl Herdr, target: &str) -> Result<std::path::PathBuf> {
+    if let Some(root) = std::env::var_os("HERDR_AGENT_DIFF_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        if root.is_absolute() && root.is_dir() {
+            return Ok(root);
+        }
+        return Err(Error::Message(
+            "invoking pane workspace directory is unavailable".into(),
+        ));
+    }
+    pane_root(herdr, target)
 }
 
 struct MappingGuard {

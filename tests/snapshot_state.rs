@@ -8,8 +8,18 @@ use tempfile::TempDir;
 #[test]
 fn scan_honors_ignore_files_and_classifies_file_content() {
     let project = TempDir::new().expect("temp project");
-    fs::write(project.path().join(".gitignore"), "ignored.txt\n").expect("ignore file");
+    fs::write(
+        project.path().join(".gitignore"),
+        "ignored.txt\ngenerated/\n",
+    )
+    .expect("ignore file");
     fs::write(project.path().join("ignored.txt"), "ignored").expect("ignored");
+    fs::create_dir(project.path().join("generated")).expect("generated");
+    let generated =
+        fs::File::create(project.path().join("generated/large.bin")).expect("large ignored file");
+    generated
+        .set_len(1024 * 1024 * 1024 + 1)
+        .expect("set ignored length");
     fs::create_dir(project.path().join("node_modules")).expect("node modules");
     fs::write(project.path().join("node_modules/pkg.js"), "ignored").expect("cache file");
     fs::write(project.path().join("binary.bin"), b"a\0b").expect("binary");
@@ -19,6 +29,7 @@ fn scan_honors_ignore_files_and_classifies_file_content() {
 
     let (files, _) = scan(project.path()).expect("scan");
     assert!(!files.contains_key(Path::new("ignored.txt")));
+    assert!(!files.contains_key(Path::new("generated/large.bin")));
     assert!(!files.contains_key(Path::new("node_modules/pkg.js")));
     assert_eq!(files[Path::new("binary.bin")].text, TextEligibility::Binary);
     assert_eq!(
@@ -49,6 +60,83 @@ fn workspace_fingerprint_skips_ignored_files_and_detects_metadata_changes() {
         workspace_fingerprint(project.path()).expect("changed fingerprint"),
         initial
     );
+}
+
+#[test]
+fn scan_uses_eclipse_bazelproject_directories_when_present() {
+    let project = TempDir::new().expect("temp project");
+    fs::create_dir(project.path().join(".eclipse")).expect("eclipse directory");
+    fs::write(
+        project.path().join(".eclipse/.bazelproject"),
+        "directories:\n  java/selected\n  -java/selected/generated\n",
+    )
+    .expect("project view");
+    fs::create_dir_all(project.path().join("java/selected/generated")).expect("generated");
+    fs::create_dir_all(project.path().join("java/other")).expect("other");
+    fs::write(project.path().join("java/selected/Main.java"), "selected").expect("selected");
+    fs::write(
+        project.path().join("java/selected/generated/Build.java"),
+        "excluded",
+    )
+    .expect("excluded");
+    fs::write(project.path().join("java/other/Other.java"), "other").expect("other");
+    fs::write(project.path().join("README.md"), "outside").expect("outside");
+
+    let (files, _) = scan(project.path()).expect("scan");
+    assert!(files.contains_key(Path::new("java/selected/Main.java")));
+    assert!(!files.contains_key(Path::new("java/selected/generated/Build.java")));
+    assert!(!files.contains_key(Path::new("java/other/Other.java")));
+    assert!(!files.contains_key(Path::new("README.md")));
+}
+
+#[test]
+fn non_bazel_repositories_keep_full_filesystem_scope() {
+    let project = TempDir::new().expect("temp project");
+    fs::write(project.path().join("README.md"), "outside").expect("outside");
+    fs::create_dir_all(project.path().join("java/other")).expect("other");
+    fs::write(project.path().join("java/other/Other.java"), "other").expect("other");
+
+    let (files, _) = scan(project.path()).expect("scan");
+    assert!(files.contains_key(Path::new("README.md")));
+    assert!(files.contains_key(Path::new("java/other/Other.java")));
+}
+
+#[test]
+fn root_level_bazelproject_activates_project_scope() {
+    let project = TempDir::new().expect("temp project");
+    fs::write(
+        project.path().join(".bazelproject"),
+        "directories:\n  java/selected\n",
+    )
+    .expect("root project view");
+    fs::create_dir_all(project.path().join("java/selected")).expect("selected directory");
+    fs::write(project.path().join("java/selected/Main.java"), "selected").expect("selected");
+    fs::write(project.path().join("README.md"), "outside").expect("outside");
+
+    let (files, _) = scan(project.path()).expect("scan");
+    assert!(files.contains_key(Path::new("java/selected/Main.java")));
+    assert!(!files.contains_key(Path::new("README.md")));
+}
+
+#[test]
+fn project_view_is_found_above_a_nested_workspace_with_upper_git_root() {
+    let repository = TempDir::new().expect("repository");
+    fs::create_dir(repository.path().join(".git")).expect("git marker");
+    fs::create_dir(repository.path().join(".eclipse")).expect("eclipse directory");
+    fs::write(
+        repository.path().join(".eclipse/.bazelproject"),
+        "directories:\n  project/java/selected\n",
+    )
+    .expect("project view");
+    let project = repository.path().join("project");
+    fs::create_dir_all(project.join("java/selected")).expect("selected directory");
+    fs::create_dir_all(project.join("java/other")).expect("other directory");
+    fs::write(project.join("java/selected/Main.java"), "selected").expect("selected");
+    fs::write(project.join("java/other/Other.java"), "other").expect("other");
+
+    let (files, _) = scan(&project).expect("scan");
+    assert!(files.contains_key(Path::new("java/selected/Main.java")));
+    assert!(!files.contains_key(Path::new("java/other/Other.java")));
 }
 
 #[cfg(unix)]
